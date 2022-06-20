@@ -2,6 +2,7 @@ package bor
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -14,6 +15,9 @@ import (
 	"time"
 
 	lru "github.com/hashicorp/golang-lru"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"golang.org/x/crypto/sha3"
 
 	"github.com/ethereum/go-ethereum/accounts"
@@ -716,14 +720,14 @@ func (c *Bor) Finalize(chain consensus.ChainHeaderReader, header *types.Header, 
 	if headerNumber%c.config.Sprint == 0 {
 		cx := statefull.ChainContext{Chain: chain, Bor: c}
 		// check and commit span
-		if err := c.checkAndCommitSpan(state, header, cx); err != nil {
+		if err := c.checkAndCommitSpan(context.Background(), nil, state, header, cx); err != nil {
 			log.Error("Error while committing span", "error", err)
 			return
 		}
 
 		if c.HeimdallClient != nil {
 			// commit statees
-			stateSyncData, err = c.CommitStates(state, header, cx)
+			stateSyncData, err = c.CommitStates(context.Background(), nil, state, header, cx)
 			if err != nil {
 				log.Error("Error while committing states", "error", err)
 				return
@@ -780,7 +784,12 @@ func (c *Bor) changeContractCodeIfNeeded(headerNumber uint64, state *state.State
 
 // FinalizeAndAssemble implements consensus.Engine, ensuring no uncles are set,
 // nor block rewards given, and returns the final block.
-func (c *Bor) FinalizeAndAssemble(chain consensus.ChainHeaderReader, header *types.Header, state *state.StateDB, txs []*types.Transaction, uncles []*types.Header, receipts []*types.Receipt) (*types.Block, error) {
+func (c *Bor) FinalizeAndAssemble(ctx context.Context, chain consensus.ChainHeaderReader, header *types.Header, state *state.StateDB, txs []*types.Transaction, uncles []*types.Header, receipts []*types.Receipt) (*types.Block, error) {
+
+	tracer := otel.GetTracerProvider().Tracer("MinerWorker")
+	finalizeCtx, finalizeSpan := tracer.Start(ctx, "FinalizeAndAssemble")
+	defer finalizeSpan.End()
+
 	stateSyncData := []*types.StateSyncData{}
 
 	headerNumber := header.Number.Uint64()
@@ -789,7 +798,7 @@ func (c *Bor) FinalizeAndAssemble(chain consensus.ChainHeaderReader, header *typ
 		cx := statefull.ChainContext{Chain: chain, Bor: c}
 
 		// check and commit span
-		err := c.checkAndCommitSpan(state, header, cx)
+		err := c.checkAndCommitSpan(finalizeCtx, tracer, state, header, cx)
 		if err != nil {
 			log.Error("Error while committing span", "error", err)
 			return nil, err
@@ -797,7 +806,7 @@ func (c *Bor) FinalizeAndAssemble(chain consensus.ChainHeaderReader, header *typ
 
 		if c.HeimdallClient != nil {
 			// commit states
-			stateSyncData, err = c.CommitStates(state, header, cx)
+			stateSyncData, err = c.CommitStates(finalizeCtx, tracer, state, header, cx)
 			if err != nil {
 				log.Error("Error while committing states", "error", err)
 				return nil, err
@@ -805,21 +814,37 @@ func (c *Bor) FinalizeAndAssemble(chain consensus.ChainHeaderReader, header *typ
 		}
 	}
 
+	start1 := time.Now()
 	if err := c.changeContractCodeIfNeeded(headerNumber, state); err != nil {
 		log.Error("Error changing contract code", "error", err)
 		return nil, err
 	}
+	diff1 := time.Since(start1)
 
 	// No block rewards in PoA, so the state remains as is and uncles are dropped
+	start2 := time.Now()
 	header.Root = state.IntermediateRoot(chain.Config().IsEIP158(header.Number))
 	header.UncleHash = types.CalcUncleHash(nil)
+	diff2 := time.Since(start2)
 
 	// Assemble block
+	start3 := time.Now()
 	block := types.NewBlock(header, txs, nil, receipts, new(trie.Trie))
+	diff3 := time.Since(start3)
 
 	// set state sync
 	bc := chain.(core.BorStateSyncer)
 	bc.SetStateSync(stateSyncData)
+
+	finalizeSpan.SetAttributes(
+		attribute.Int("number", int(header.Number.Int64())),
+		attribute.String("hash", header.Hash().String()),
+		attribute.Int("number of txs", len(txs)),
+		attribute.Int("gas used", int(block.GasUsed())),
+		attribute.String("change contract code time", diff1.String()),
+		attribute.String("intermeddiate root hash calc time", diff2.String()),
+		attribute.String("assemble new block time", diff3.String()),
+	)
 
 	// return the final block for sealing
 	return block, nil
@@ -837,7 +862,11 @@ func (c *Bor) Authorize(signer common.Address, signFn SignerFn) {
 
 // Seal implements consensus.Engine, attempting to create a sealed block using
 // the local signing credentials.
-func (c *Bor) Seal(chain consensus.ChainHeaderReader, block *types.Block, results chan<- *types.Block, stop <-chan struct{}) error {
+func (c *Bor) Seal(ctx context.Context, chain consensus.ChainHeaderReader, block *types.Block, results chan<- *types.Block, stop <-chan struct{}) error {
+
+	tracer := otel.GetTracerProvider().Tracer("MinerWorker")
+	_, sealSpan := tracer.Start(ctx, "Seal")
+
 	header := block.Header()
 	// Sealing the genesis block is not supported
 	number := header.Number.Uint64()
@@ -862,7 +891,10 @@ func (c *Bor) Seal(chain consensus.ChainHeaderReader, block *types.Block, result
 	// Bail out if we're unauthorized to sign a block
 	if !snap.ValidatorSet.HasAddress(signer.Bytes()) {
 		// Check the UnauthorizedSignerError.Error() msg to see why we pass number-1
-		return &UnauthorizedSignerError{number - 1, signer.Bytes()}
+		err := &UnauthorizedSignerError{number - 1, signer.Bytes()}
+		sealSpan.SetAttributes(attribute.String("error", err.Error()))
+		sealSpan.End()
+		return err
 	}
 
 	successionNumber, err := snap.GetSignerSuccessionNumber(signer)
@@ -884,7 +916,7 @@ func (c *Bor) Seal(chain consensus.ChainHeaderReader, block *types.Block, result
 	// Wait until sealing is terminated or delay timeout.
 	log.Info("Waiting for slot to sign and propagate", "number", number, "hash", header.Hash, "delay-in-sec", uint(delay), "delay", common.PrettyDuration(delay))
 
-	go func() {
+	go func(sealSpan trace.Span) {
 		select {
 		case <-stop:
 			log.Debug("Discarding sealing operation for block", "number", number)
@@ -907,13 +939,20 @@ func (c *Bor) Seal(chain consensus.ChainHeaderReader, block *types.Block, result
 				"delay", delay,
 				"headerDifficulty", header.Difficulty,
 			)
+			sealSpan.SetAttributes(
+				attribute.Int("number", int(number)),
+				attribute.String("hash", header.Hash().String()),
+				attribute.String("delay", delay.String()),
+				attribute.Bool("out-of-turn", wiggle > 0),
+			)
+			sealSpan.End()
 		}
 		select {
 		case results <- block.WithSeal(header):
 		default:
 			log.Warn("Sealing result was not read by miner", "number", number, "sealhash", SealHash(header, c.config))
 		}
-	}()
+	}(sealSpan)
 
 	return nil
 }
@@ -969,19 +1008,37 @@ func (c *Bor) Close() error {
 }
 
 func (c *Bor) checkAndCommitSpan(
+	ctx context.Context,
+	tracer trace.Tracer,
 	state *state.StateDB,
 	header *types.Header,
 	chain core.ChainContext,
 ) error {
+
+	checkAndCommitSpanCtx := context.Background()
+	var checkAndCommitSpan trace.Span
+	if tracer != nil {
+		checkAndCommitSpanCtx, checkAndCommitSpan = tracer.Start(ctx, "checkAndCommitSpan")
+		defer checkAndCommitSpan.End()
+	}
+
 	headerNumber := header.Number.Uint64()
 
 	span, err := c.spanner.GetCurrentSpan(header.ParentHash)
+	if checkAndCommitSpan != nil {
+		checkAndCommitSpan.SetAttributes(
+			attribute.Int("number", int(headerNumber)),
+			attribute.String("hash", header.Hash().String()),
+			attribute.Int("current span id", int(span.ID)),
+			attribute.Bool("error", err != nil),
+		)
+	}
 	if err != nil {
 		return err
 	}
 
 	if c.needToCommitSpan(span, headerNumber) {
-		return c.FetchAndCommitSpan(span.ID+1, state, header, chain)
+		return c.FetchAndCommitSpan(checkAndCommitSpanCtx, tracer, span.ID+1, state, header, chain)
 	}
 
 	return nil
@@ -1007,11 +1064,20 @@ func (c *Bor) needToCommitSpan(span *span.Span, headerNumber uint64) bool {
 }
 
 func (c *Bor) FetchAndCommitSpan(
+	ctx context.Context,
+	tracer trace.Tracer,
 	newSpanID uint64,
 	state *state.StateDB,
 	header *types.Header,
 	chain core.ChainContext,
 ) error {
+
+	var fetchAndCommitSpan trace.Span
+	if tracer != nil {
+		_, fetchAndCommitSpan = tracer.Start(ctx, "FetchAndCommitSpan")
+		defer fetchAndCommitSpan.End()
+	}
+
 	var heimdallSpan span.HeimdallSpan
 
 	if c.HeimdallClient == nil {
@@ -1040,15 +1106,33 @@ func (c *Bor) FetchAndCommitSpan(
 		)
 	}
 
+	if fetchAndCommitSpan != nil {
+		fetchAndCommitSpan.SetAttributes(
+			attribute.Int("number", int(header.Number.Int64())),
+			attribute.String("hash", header.Hash().String()),
+			attribute.Int("fetched span id", int(heimdallSpan.ID)),
+		)
+	}
+
 	return c.spanner.CommitSpan(heimdallSpan, state, header, chain)
 }
 
 // CommitStates commit states
 func (c *Bor) CommitStates(
+	ctx context.Context,
+	tracer trace.Tracer,
 	state *state.StateDB,
 	header *types.Header,
 	chain statefull.ChainContext,
 ) ([]*types.StateSyncData, error) {
+
+	var commitStatesSpan trace.Span
+	if tracer != nil {
+		_, commitStatesSpan = tracer.Start(ctx, "CommitStates")
+		defer commitStatesSpan.End()
+	}
+
+	fetchStart := time.Now()
 	stateSyncs := make([]*types.StateSyncData, 0)
 	number := header.Number.Uint64()
 
@@ -1076,8 +1160,9 @@ func (c *Bor) CommitStates(
 		}
 	}
 
+	fetchTime := time.Since(fetchStart)
+	processStart := time.Now()
 	totalGas := 0 /// limit on gas for state sync per block
-
 	chainID := c.chainConfig.ChainID.String()
 
 	for _, eventRecord := range eventRecords {
@@ -1109,6 +1194,18 @@ func (c *Bor) CommitStates(
 		lastStateID++
 	}
 
+	processTime := time.Since(processStart)
+
+	if commitStatesSpan != nil {
+		commitStatesSpan.SetAttributes(
+			attribute.Int("number", int(number)),
+			attribute.String("hash", header.Hash().String()),
+			attribute.String("fetch time", fetchTime.String()),
+			attribute.String("process time", processTime.String()),
+			attribute.Int("state sync count", len(stateSyncs)),
+			attribute.Int("total gas", totalGas),
+		)
+	}
 	log.Info("StateSyncData", "Gas", totalGas, "Block-number", number, "LastStateID", lastStateID, "TotalRecords", len(eventRecords))
 
 	return stateSyncs, nil

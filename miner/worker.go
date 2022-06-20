@@ -17,6 +17,7 @@
 package miner
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math/big"
@@ -25,6 +26,9 @@ import (
 	"time"
 
 	mapset "github.com/deckarep/golang-set"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
@@ -144,6 +148,7 @@ func (env *environment) discard() {
 
 // task contains all information for consensus engine sealing and result submitting.
 type task struct {
+	ctx       context.Context
 	receipts  []*types.Receipt
 	state     *state.StateDB
 	block     *types.Block
@@ -158,6 +163,7 @@ const (
 
 // newWorkReq represents a request for new sealing work submitting with relative interrupt notifier.
 type newWorkReq struct {
+	ctx       context.Context
 	interrupt *int32
 	noempty   bool
 	timestamp int64
@@ -165,6 +171,7 @@ type newWorkReq struct {
 
 // getWorkReq represents a request for getting a new sealing work with provided parameters.
 type getWorkReq struct {
+	ctx    context.Context
 	params *generateParams
 	err    error
 	result chan *types.Block
@@ -246,6 +253,9 @@ type worker struct {
 	skipSealHook func(*task) bool                   // Method to decide whether skipping the sealing.
 	fullTaskHook func()                             // Method to call before pushing the full sealing task.
 	resubmitHook func(time.Duration, time.Duration) // Method to call upon updating resubmitting interval.
+
+	tracer trace.Tracer
+	span   trace.Span
 }
 
 func newWorker(config *Config, chainConfig *params.ChainConfig, engine consensus.Engine, eth Backend, mux *event.TypeMux, isLocalBlock func(header *types.Header) bool, init bool) *worker {
@@ -272,6 +282,7 @@ func newWorker(config *Config, chainConfig *params.ChainConfig, engine consensus
 		startCh:            make(chan struct{}, 1),
 		resubmitIntervalCh: make(chan time.Duration),
 		resubmitAdjustCh:   make(chan *intervalAdjust, resubmitAdjustChanSize),
+		tracer:             otel.GetTracerProvider().Tracer("MinerWorker"),
 	}
 	// Subscribe NewTxsEvent for tx pool
 	worker.txsSub = eth.TxPool().SubscribeNewTxsEvent(worker.txsCh)
@@ -286,9 +297,12 @@ func newWorker(config *Config, chainConfig *params.ChainConfig, engine consensus
 		recommit = minRecommitInterval
 	}
 
+	newWorkerCtx, newWorkSpan := worker.tracer.Start(context.Background(), "newWorker")
+	worker.span = newWorkSpan
+
 	worker.wg.Add(4)
 	go worker.mainLoop()
-	go worker.newWorkLoop(recommit)
+	go worker.newWorkLoop(newWorkerCtx, recommit)
 	go worker.resultLoop()
 	go worker.taskLoop()
 
@@ -386,6 +400,7 @@ func (w *worker) close() {
 	atomic.StoreInt32(&w.running, 0)
 	close(w.exitCh)
 	w.wg.Wait()
+	w.span.End()
 }
 
 // recalcRecommit recalculates the resubmitting interval upon feedback.
@@ -418,7 +433,7 @@ func recalcRecommit(minRecommit, prev time.Duration, target float64, inc bool) t
 }
 
 // newWorkLoop is a standalone goroutine to submit new sealing work upon received events.
-func (w *worker) newWorkLoop(recommit time.Duration) {
+func (w *worker) newWorkLoop(ctx context.Context, recommit time.Duration) {
 	defer w.wg.Done()
 	var (
 		interrupt   *int32
@@ -437,7 +452,7 @@ func (w *worker) newWorkLoop(recommit time.Duration) {
 		}
 		interrupt = new(int32)
 		select {
-		case w.newWorkCh <- &newWorkReq{interrupt: interrupt, noempty: noempty, timestamp: timestamp}:
+		case w.newWorkCh <- &newWorkReq{interrupt: interrupt, noempty: noempty, timestamp: timestamp, ctx: ctx}:
 		case <-w.exitCh:
 			return
 		}
@@ -535,10 +550,10 @@ func (w *worker) mainLoop() {
 	for {
 		select {
 		case req := <-w.newWorkCh:
-			w.commitWork(req.interrupt, req.noempty, req.timestamp)
+			w.commitWork(req.ctx, req.interrupt, req.noempty, req.timestamp)
 
 		case req := <-w.getWorkCh:
-			block, err := w.generateWork(req.params)
+			block, err := w.generateWork(req.ctx, req.params)
 			if err != nil {
 				req.err = err
 				req.result <- nil
@@ -566,7 +581,7 @@ func (w *worker) mainLoop() {
 			if w.isRunning() && w.current != nil && len(w.current.uncles) < 2 {
 				start := time.Now()
 				if err := w.commitUncle(w.current, ev.Block.Header()); err == nil {
-					w.commit(w.current.copy(), nil, true, start)
+					w.commit(context.Background(), w.current.copy(), nil, true, start)
 				}
 			}
 
@@ -613,7 +628,7 @@ func (w *worker) mainLoop() {
 				// submit sealing work here since all empty submission will be rejected
 				// by clique. Of course the advance sealing(empty submission) is disabled.
 				if w.chainConfig.Clique != nil && w.chainConfig.Clique.Period == 0 {
-					w.commitWork(nil, true, time.Now().Unix())
+					w.commitWork(context.Background(), nil, true, time.Now().Unix())
 				}
 			}
 			atomic.AddInt32(&w.newTxs, int32(len(ev.Txs)))
@@ -669,7 +684,7 @@ func (w *worker) taskLoop() {
 			w.pendingTasks[sealHash] = task
 			w.pendingMu.Unlock()
 
-			if err := w.engine.Seal(w.chain, task.block, w.resultCh, stopCh); err != nil {
+			if err := w.engine.Seal(task.ctx, w.chain, task.block, w.resultCh, stopCh); err != nil {
 				log.Warn("Block sealing failed", "err", err)
 				w.pendingMu.Lock()
 				delete(w.pendingTasks, sealHash)
@@ -697,6 +712,7 @@ func (w *worker) resultLoop() {
 			if w.chain.HasBlock(block.Hash(), block.NumberU64()) {
 				continue
 			}
+			getBlockStart := time.Now()
 			oldBlock := w.chain.GetBlockByNumber(block.NumberU64())
 			if oldBlock != nil {
 				oldBlockAuthor, _ := w.chain.Engine().Author(oldBlock.Header())
@@ -706,6 +722,7 @@ func (w *worker) resultLoop() {
 					continue
 				}
 			}
+			getBlockTime := time.Since(getBlockStart)
 			var (
 				sealhash = w.engine.SealHash(block.Header())
 				hash     = block.Hash()
@@ -713,6 +730,7 @@ func (w *worker) resultLoop() {
 			w.pendingMu.RLock()
 			task, exist := w.pendingTasks[sealhash]
 			w.pendingMu.RUnlock()
+			_, resultLoopSpan := w.tracer.Start(task.ctx, "resultLoop")
 			if !exist {
 				log.Error("Block found but no relative pending task", "number", block.Number(), "sealhash", sealhash, "hash", hash)
 				continue
@@ -744,7 +762,20 @@ func (w *worker) resultLoop() {
 				logs = append(logs, receipt.Logs...)
 			}
 			// Commit block and state to database.
+			writeBlockStart := time.Now()
 			_, err := w.chain.WriteBlockAndSetHead(block, receipts, logs, task.state, true)
+			writeBlockTime := time.Since(writeBlockStart)
+			resultLoopSpan.SetAttributes(
+				attribute.String("hash", hash.String()),
+				attribute.Int("number", int(block.Number().Uint64())),
+				attribute.Int("txns", block.Transactions().Len()),
+				attribute.Int("gas used", int(block.GasUsed())),
+				attribute.String("Block fetch and check time taken", getBlockTime.String()),
+				attribute.String("WriteBlockAndSetHead time taken", writeBlockTime.String()),
+				attribute.Bool("error", err != nil),
+			)
+			resultLoopSpan.End()
+
 			if err != nil {
 				log.Error("Failed writing block to chain", "err", err)
 				continue
@@ -757,7 +788,6 @@ func (w *worker) resultLoop() {
 
 			// Insert the block into the set of pending ones to resultLoop for confirmations
 			w.unconfirmed.Insert(block.NumberU64(), block.Hash())
-
 		case <-w.exitCh:
 			return
 		}
@@ -1068,7 +1098,11 @@ func (w *worker) prepareWork(genParams *generateParams) (*environment, error) {
 // fillTransactions retrieves the pending transactions from the txpool and fills them
 // into the given sealing block. The transaction selection and ordering strategy can
 // be customized with the plugin in the future.
-func (w *worker) fillTransactions(interrupt *int32, env *environment) {
+func (w *worker) fillTransactions(ctx context.Context, interrupt *int32, env *environment) {
+
+	_, fillTransactionsSpan := w.tracer.Start(ctx, "fillTransactions")
+	defer fillTransactionsSpan.End()
+
 	// Split the pending transactions into locals and remotes
 	// Fill the block with all available pending transactions.
 	pending := w.eth.TxPool().Pending(true)
@@ -1079,35 +1113,50 @@ func (w *worker) fillTransactions(interrupt *int32, env *environment) {
 			localTxs[account] = txs
 		}
 	}
+	lenLocals, lenNewLocals, localEnvTCount, lenRemotes, lenNewRemotes, remoteEnvTCount := 0, 0, 0, 0, 0, 0
 	if len(localTxs) > 0 {
+		lenLocals = len(localTxs)
 		txs := types.NewTransactionsByPriceAndNonce(env.signer, localTxs, env.header.BaseFee)
+		lenNewLocals = txs.GetTxs()
 		if w.commitTransactions(env, txs, interrupt) {
 			return
 		}
+		localEnvTCount = env.tcount
 	}
 	if len(remoteTxs) > 0 {
+		lenRemotes = len(remoteTxs)
 		txs := types.NewTransactionsByPriceAndNonce(env.signer, remoteTxs, env.header.BaseFee)
+		lenNewRemotes = txs.GetTxs()
 		if w.commitTransactions(env, txs, interrupt) {
 			return
 		}
+		remoteEnvTCount = env.tcount
 	}
+	fillTransactionsSpan.SetAttributes(
+		attribute.Int("len of localTxs", lenLocals),
+		attribute.Int("len of sorted localTxs", lenNewLocals),
+		attribute.Int("len of final localTxs ", localEnvTCount),
+		attribute.Int("len of remoteTxs", lenRemotes),
+		attribute.Int("len of sorted remoteTxs", lenNewRemotes),
+		attribute.Int("len of final remoteTxs", remoteEnvTCount),
+	)
 }
 
 // generateWork generates a sealing block based on the given parameters.
-func (w *worker) generateWork(params *generateParams) (*types.Block, error) {
+func (w *worker) generateWork(ctx context.Context, params *generateParams) (*types.Block, error) {
 	work, err := w.prepareWork(params)
 	if err != nil {
 		return nil, err
 	}
 	defer work.discard()
 
-	w.fillTransactions(nil, work)
-	return w.engine.FinalizeAndAssemble(w.chain, work.header, work.state, work.txs, work.unclelist(), work.receipts)
+	w.fillTransactions(ctx, nil, work)
+	return w.engine.FinalizeAndAssemble(ctx, w.chain, work.header, work.state, work.txs, work.unclelist(), work.receipts)
 }
 
 // commitWork generates several new sealing tasks based on the parent block
 // and submit them to the sealer.
-func (w *worker) commitWork(interrupt *int32, noempty bool, timestamp int64) {
+func (w *worker) commitWork(ctx context.Context, interrupt *int32, noempty bool, timestamp int64) {
 	start := time.Now()
 
 	// Set the coinbase if the worker is running or it's required
@@ -1126,14 +1175,21 @@ func (w *worker) commitWork(interrupt *int32, noempty bool, timestamp int64) {
 	if err != nil {
 		return
 	}
+
+	commitWorkCtx, commitWorkSpan := w.tracer.Start(ctx, "commitWork")
+	commitWorkSpan.SetAttributes(
+		attribute.Int("number", int(work.header.Number.Uint64())),
+	)
+	defer commitWorkSpan.End()
+
 	// Create an empty block based on temporary copied state for
 	// sealing in advance without waiting block execution finished.
 	if !noempty && atomic.LoadUint32(&w.noempty) == 0 {
-		w.commit(work.copy(), nil, false, start)
+		w.commit(commitWorkCtx, work.copy(), nil, false, start)
 	}
 	// Fill pending transactions from the txpool
-	w.fillTransactions(interrupt, work)
-	w.commit(work.copy(), w.fullTaskHook, true, start)
+	w.fillTransactions(commitWorkCtx, interrupt, work)
+	w.commit(commitWorkCtx, work.copy(), w.fullTaskHook, true, start)
 
 	// Swap out the old work with the new one, terminating any leftover
 	// prefetcher processes in the mean time and starting a new one.
@@ -1141,28 +1197,39 @@ func (w *worker) commitWork(interrupt *int32, noempty bool, timestamp int64) {
 		w.current.discard()
 	}
 	w.current = work
+
 }
 
 // commit runs any post-transaction state modifications, assembles the final block
 // and commits new work if consensus engine is running.
 // Note the assumption is held that the mutation is allowed to the passed env, do
 // the deep copy first.
-func (w *worker) commit(env *environment, interval func(), update bool, start time.Time) error {
+func (w *worker) commit(ctx context.Context, env *environment, interval func(), update bool, start time.Time) error {
+
 	if w.isRunning() {
+		commitCtx, commitSpan := w.tracer.Start(ctx, "commit")
+		defer commitSpan.End()
 		if interval != nil {
 			interval()
 		}
 		// Create a local environment copy, avoid the data race with snapshot state.
 		// https://github.com/ethereum/go-ethereum/issues/24299
 		env := env.copy()
-		block, err := w.engine.FinalizeAndAssemble(w.chain, env.header, env.state, env.txs, env.unclelist(), env.receipts)
+		block, err := w.engine.FinalizeAndAssemble(commitCtx, w.chain, env.header, env.state, env.txs, env.unclelist(), env.receipts)
+		commitSpan.SetAttributes(
+			attribute.Int("number", int(block.Number().Uint64())),
+			attribute.String("hash", block.Hash().String()),
+			attribute.String("sealhash", w.engine.SealHash(block.Header()).String()),
+			attribute.Int("len of env.txs", len(env.txs)),
+			attribute.Bool("error", err != nil),
+		)
 		if err != nil {
 			return err
 		}
 		// If we're post merge, just ignore
 		if !w.isTTDReached(block.Header()) {
 			select {
-			case w.taskCh <- &task{receipts: env.receipts, state: env.state, block: block, createdAt: time.Now()}:
+			case w.taskCh <- &task{ctx: commitCtx, receipts: env.receipts, state: env.state, block: block, createdAt: time.Now()}:
 				w.unconfirmed.Shift(block.NumberU64() - 1)
 				log.Info("Commit new sealing work", "number", block.Number(), "sealhash", w.engine.SealHash(block.Header()),
 					"uncles", len(env.uncles), "txs", env.tcount,
@@ -1177,6 +1244,7 @@ func (w *worker) commit(env *environment, interval func(), update bool, start ti
 	if update {
 		w.updateSnapshot(env)
 	}
+
 	return nil
 }
 
