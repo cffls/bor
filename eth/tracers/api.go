@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"math/big"
 	"os"
 	"runtime"
 	"sync"
@@ -61,6 +62,8 @@ const (
 	// For non-archive nodes, this limit _will_ be overblown, as disk-backed tries
 	// will only be found every ~15K blocks or so.
 	defaultTracechainMemLimit = common.StorageSize(500 * 1024 * 1024)
+
+	defaultPath = string("./")
 )
 
 // Backend interface provides the common API services (that are provided by
@@ -170,6 +173,7 @@ type TraceConfig struct {
 	Tracer  *string
 	Timeout *string
 	Reexec  *uint64
+	Path    *string
 }
 
 // TraceCallConfig is the config for traceCall API. It holds one more
@@ -575,10 +579,16 @@ func (api *API) traceBlock(ctx context.Context, block *types.Block, config *Trac
 	if config != nil && config.Reexec != nil {
 		reexec = *config.Reexec
 	}
+	path := defaultPath
+	if config != nil && config.Path != nil {
+		path = *config.Path
+	}
 	statedb, err := api.backend.StateAtBlock(ctx, parent, reexec, nil, true, false)
 	if err != nil {
 		return nil, err
 	}
+	// create and add empty mvHashMap in statedb as StateAtBlock does not have mvHashmap in it.
+	statedb.AddEmptyMVHashMap()
 	// Execute all the transaction contained within the block concurrently
 	var (
 		signer  = types.MakeSigner(api.backend.ChainConfig(), block.Number())
@@ -615,10 +625,17 @@ func (api *API) traceBlock(ctx context.Context, block *types.Block, config *Trac
 			}
 		}()
 	}
+
+	IOdump := "TransactionIndex, Incarnation, VersionTxIdx, VersionInc, Path, Operation\n"
 	// Feed the transactions into the tracers and return
 	var failed error
 	blockCtx := core.NewEVMBlockContext(block.Header(), api.chainContext(ctx), nil)
+
+	london := api.backend.ChainConfig().IsLondon(block.Number())
+
 	for i, tx := range txs {
+		// copy of statedb
+		statedb := statedb.Copy()
 		// Send the trace task over for execution
 		jobs <- &txTraceTask{statedb: statedb.Copy(), index: i}
 
@@ -626,14 +643,53 @@ func (api *API) traceBlock(ctx context.Context, block *types.Block, config *Trac
 		msg, _ := tx.AsMessage(signer, block.BaseFee())
 		statedb.Prepare(tx.Hash(), i)
 		vmenv := vm.NewEVM(blockCtx, core.NewEVMTxContext(msg), statedb, api.backend.ChainConfig(), vm.Config{})
-		if _, err := core.ApplyMessage(vmenv, msg, new(core.GasPool).AddGas(msg.Gas())); err != nil {
+
+		coinbaseBalance := statedb.GetBalance(blockCtx.Coinbase)
+
+		result, err := core.ApplyMessageNoFeeBurnOrTip(vmenv, msg, new(core.GasPool).AddGas(msg.Gas()))
+
+		if err != nil {
 			failed = err
 			break
 		}
+
+		if london {
+			statedb.AddBalance(result.BurntContractAddress, result.FeeBurnt)
+		}
+
+		statedb.AddBalance(blockCtx.Coinbase, result.FeeTipped)
+		output1 := new(big.Int).SetBytes(result.SenderInitBalance.Bytes())
+		output2 := new(big.Int).SetBytes(coinbaseBalance.Bytes())
+
+		// Deprecating transfer log and will be removed in future fork. PLEASE DO NOT USE this transfer log going forward. Parameters won't get updated as expected going forward with EIP1559
+		// add transfer log
+		core.AddFeeTransferLog(
+			statedb,
+
+			msg.From(),
+			blockCtx.Coinbase,
+
+			result.FeeTipped,
+			result.SenderInitBalance,
+			coinbaseBalance,
+			output1.Sub(output1, result.FeeTipped),
+			output2.Add(output2, result.FeeTipped),
+		)
+
 		// Finalize the state so any modifications are written to the trie
 		// Only delete empty objects if EIP158/161 (a.k.a Spurious Dragon) is in effect
 		statedb.Finalise(vmenv.ChainConfig().IsEIP158(block.Number()))
+		statedb.FlushMVWriteSet()
+		strRead := statedb.GetReadMapDump()
+		strWrite := statedb.GetWriteMapDump()
+		IOdump += strRead + strWrite
 	}
+	// make sure that the file exists and write IOdump
+	err = ioutil.WriteFile(path+"data.csv", []byte(fmt.Sprintf(IOdump)), 0644)
+	if err != nil {
+		fmt.Println("Writting IOdump to the file FAILED!\n IOdump:", IOdump)
+	}
+
 	close(jobs)
 	pend.Wait()
 

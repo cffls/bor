@@ -18,6 +18,7 @@
 package state
 
 import (
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math/big"
@@ -347,6 +348,32 @@ func (sw *StateDB) ApplyMVWriteSet(writes []blockstm.WriteDescriptor) {
 			}
 		}
 	}
+}
+
+// get readMap Dump of format: "TxIdx, Inc, Path, Read"
+func (s *StateDB) GetReadMapDump() string {
+	str := ""
+	for _, val := range s.MVReadList() {
+		// fmt.SprintF is expensive, but can be sued for debugging
+		str += fmt.Sprintf("%v", s.txIndex) + ", " + fmt.Sprintf("%v", s.incarnation) + ", " + fmt.Sprintf("%v", val.V.TxnIndex) + ", " + fmt.Sprintf("%v", val.V.Incarnation) + ", " + hex.EncodeToString(val.Path) + ", " + "Read\n"
+	}
+	return str
+}
+
+// get writeMap Dump of format: "TxIdx, Inc, Path, Write"
+func (s *StateDB) GetWriteMapDump() string {
+	str := ""
+	for _, val := range s.MVWriteList() {
+		// fmt.SprintF is expensive, but can be sued for debugging
+		str += fmt.Sprintf("%v", s.txIndex) + ", " + fmt.Sprintf("%v", s.incarnation) + ", " + fmt.Sprintf("%v", val.V.TxnIndex) + ", " + fmt.Sprintf("%v", val.V.Incarnation) + ", " + hex.EncodeToString(val.Path) + ", " + "Write\n"
+	}
+	return str
+}
+
+// add empty MVHashMap to StateDB
+func (s *StateDB) AddEmptyMVHashMap() {
+	mvh := blockstm.MakeMVHashMap()
+	s.mvHashmap = mvh
 }
 
 // StartPrefetcher initializes a new trie prefetcher to pull in nodes from the
