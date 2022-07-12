@@ -17,16 +17,19 @@
 package core
 
 import (
+	"bytes"
 	"fmt"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/misc"
+	"github.com/ethereum/go-ethereum/core/blockstm"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 )
 
@@ -60,18 +63,28 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 	var (
 		receipts    types.Receipts
 		usedGas     = new(uint64)
+		mvusedGas   = new(uint64)
 		header      = block.Header()
 		blockHash   = block.Hash()
 		blockNumber = block.Number()
 		allLogs     []*types.Log
 		gp          = new(GasPool).AddGas(block.GasLimit())
+		mvgp        = new(GasPool).AddGas(block.GasLimit())
 	)
 	// Mutate the block and state according to any hard-fork specs
 	if p.config.DAOForkSupport && p.config.DAOForkBlock != nil && p.config.DAOForkBlock.Cmp(block.Number()) == 0 {
 		misc.ApplyDAOHardFork(statedb)
 	}
+
+	cleanStatedb := statedb.Copy()
+
+	mvhm := blockstm.MakeMVHashMap()
+
+	mvStatedb := statedb.Copy()
+
 	blockContext := NewEVMBlockContext(header, p.bc, nil)
 	vmenv := vm.NewEVM(blockContext, vm.TxContext{}, statedb, p.config, cfg)
+
 	// Iterate over and process the individual transactions
 	for i, tx := range block.Transactions() {
 		msg, err := tx.AsMessage(types.MakeSigner(p.config, header.Number), header.BaseFee)
@@ -80,16 +93,49 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 		}
 		statedb.Prepare(tx.Hash(), i)
 		receipt, err := applyTransaction(msg, p.config, p.bc, nil, gp, statedb, blockNumber, blockHash, tx, usedGas, vmenv)
+
 		if err != nil {
 			return nil, nil, 0, fmt.Errorf("could not apply tx %d [%v]: %w", i, tx.Hash().Hex(), err)
 		}
-		receipts = append(receipts, receipt)
-		allLogs = append(allLogs, receipt.Logs...)
+
+		dirtyMVStatedb := cleanStatedb.Copy()
+		dirtyMVStatedb.SetMVHashmap(mvhm)
+		dirtyMVStatedb.Prepare(tx.Hash(), i)
+		mvStatedb.Prepare(tx.Hash(), i)
+		mvvmenv := vm.NewEVM(blockContext, vm.TxContext{}, dirtyMVStatedb, p.config, cfg)
+		mvreceipt, err := applyMVTransaction(msg, p.config, p.bc, nil, mvgp, dirtyMVStatedb, blockNumber, blockHash, tx, mvusedGas, mvvmenv, mvStatedb)
+
+		if receipt != nil && mvreceipt == nil {
+			panic("mv receipt is nil but receipt is not nil")
+		}
+
+		if !bytes.Equal(mvreceipt.PostState, receipt.PostState) {
+			panic("mv state mismatch")
+		}
+
+		if mvreceipt.CumulativeGasUsed != receipt.CumulativeGasUsed {
+			fmt.Println("Tx hash:", tx.Hash())
+			fmt.Println("Tx index", i)
+			log.Warn("mv used gas mismatch", "tx", tx.Hash(), "mvCumulativeGasUsed", mvreceipt.CumulativeGasUsed, "correct CumulativeGasUsed", receipt.CumulativeGasUsed)
+			log.Warn("gas used by current tx", "tx", tx.Hash(), "mvUsedGas", mvreceipt.GasUsed, "correct usedGas", receipt.GasUsed)
+			panic("mv used gas mismatch")
+		}
+
+		if len(mvreceipt.Logs) != len(receipt.Logs) {
+			log.Warn("mv logs mismatch", "tx", tx.Hash(), "mvLogs", len(mvreceipt.Logs), "correctLogs", len(receipt.Logs))
+			panic("mv logs mismatch")
+		}
+
+		if err != nil {
+			return nil, nil, 0, fmt.Errorf("could not apply mv tx %d [%v]: %w", i, tx.Hash().Hex(), err)
+		}
+		receipts = append(receipts, mvreceipt)
+		allLogs = append(allLogs, mvreceipt.Logs...)
 	}
 	// Finalize the block, applying any consensus engine specific extras (e.g. block rewards)
 	p.engine.Finalize(p.bc, header, statedb, block.Transactions(), block.Uncles())
 
-	return receipts, allLogs, *usedGas, nil
+	return receipts, allLogs, *mvusedGas, nil
 }
 
 func applyTransaction(msg types.Message, config *params.ChainConfig, bc ChainContext, author *common.Address, gp *GasPool, statedb *state.StateDB, blockNumber *big.Int, blockHash common.Hash, tx *types.Transaction, usedGas *uint64, evm *vm.EVM) (*types.Receipt, error) {
@@ -134,6 +180,59 @@ func applyTransaction(msg types.Message, config *params.ChainConfig, bc ChainCon
 	receipt.BlockHash = blockHash
 	receipt.BlockNumber = blockNumber
 	receipt.TransactionIndex = uint(statedb.TxIndex())
+	return receipt, err
+}
+
+func applyMVTransaction(msg types.Message, config *params.ChainConfig, bc ChainContext, author *common.Address, gp *GasPool, statedb *state.StateDB, blockNumber *big.Int, blockHash common.Hash, tx *types.Transaction, usedGas *uint64, evm *vm.EVM, finalStatedb *state.StateDB) (*types.Receipt, error) {
+	// Create a new context to be used in the EVM environment.
+	txContext := NewEVMTxContext(msg)
+	evm.Reset(txContext, statedb)
+
+	// Apply the transaction to the current state (included in the env).
+	result, err := ApplyMessage(evm, msg, gp)
+	if err != nil {
+		return nil, err
+	}
+
+	if config.IsByzantium(blockNumber) {
+		statedb.Finalise(true)
+	} else {
+		statedb.IntermediateRoot(config.IsEIP158(blockNumber)).Bytes()
+	}
+
+	finalStatedb.ApplyMVWriteSet(statedb.MVWriteList())
+
+	// Update the state with pending changes.
+	var root []byte
+	if config.IsByzantium(blockNumber) {
+		finalStatedb.Finalise(true)
+	} else {
+		root = finalStatedb.IntermediateRoot(config.IsEIP158(blockNumber)).Bytes()
+	}
+	*usedGas += result.UsedGas
+
+	// Create a new receipt for the transaction, storing the intermediate root and gas used
+	// by the tx.
+	receipt := &types.Receipt{Type: tx.Type(), PostState: root, CumulativeGasUsed: *usedGas}
+	if result.Failed() {
+		receipt.Status = types.ReceiptStatusFailed
+	} else {
+		receipt.Status = types.ReceiptStatusSuccessful
+	}
+	receipt.TxHash = tx.Hash()
+	receipt.GasUsed = result.UsedGas
+
+	// If the transaction created a contract, store the creation address in the receipt.
+	if msg.To() == nil {
+		receipt.ContractAddress = crypto.CreateAddress(evm.TxContext.Origin, tx.Nonce())
+	}
+
+	// Set the receipt logs and create the bloom filter.
+	receipt.Logs = statedb.GetLogs(tx.Hash(), blockHash)
+	receipt.Bloom = types.CreateBloom(types.Receipts{receipt})
+	receipt.BlockHash = blockHash
+	receipt.BlockNumber = blockNumber
+	receipt.TransactionIndex = uint(finalStatedb.TxIndex())
 	return receipt, err
 }
 
