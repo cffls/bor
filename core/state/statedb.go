@@ -85,6 +85,7 @@ type StateDB struct {
 	incarnation int
 	readMap     map[string]blockstm.ReadDescriptor
 	writeMap    map[string]blockstm.WriteDescriptor
+	invalidRead bool
 
 	// DB error.
 	// State objects are used by the consensus core and VM which are
@@ -206,6 +207,14 @@ func (s *StateDB) ensureWriteMap() {
 	}
 }
 
+func (s *StateDB) HadInvalidRead() bool {
+	return s.invalidRead
+}
+
+func (s *StateDB) SetIncarnation(inc int) {
+	s.incarnation = inc
+}
+
 func MVRead[T any](s *StateDB, k []byte, defaultV T, readStorage func(s *StateDB) T) (v T) {
 	if s.mvHashmap == nil {
 		return readStorage(s)
@@ -238,6 +247,7 @@ func MVRead[T any](s *StateDB, k []byte, defaultV T, readStorage func(s *StateDB
 		}
 	case blockstm.MVReadResultDependency:
 		{
+			s.invalidRead = true
 			return defaultV
 		}
 	case blockstm.MVReadResultNone:

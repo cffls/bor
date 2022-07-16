@@ -51,11 +51,11 @@ type TxnInputOutput struct {
 	outputs []TxnOutput
 }
 
-func (io *TxnInputOutput) readSet(txnIdx int) []ReadDescriptor {
+func (io *TxnInputOutput) ReadSet(txnIdx int) []ReadDescriptor {
 	return io.inputs[txnIdx]
 }
 
-func (io *TxnInputOutput) writeSet(txnIdx int) []WriteDescriptor {
+func (io *TxnInputOutput) WriteSet(txnIdx int) []WriteDescriptor {
 	return io.outputs[txnIdx]
 }
 

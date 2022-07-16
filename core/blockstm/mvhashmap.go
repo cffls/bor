@@ -193,7 +193,7 @@ func (mv *MVHashMap) Read(k []byte, txIdx int) (res MVReadResult) {
 func ValidateVersion(txIdx int, lastInputOutput *TxnInputOutput, versionedData *MVHashMap) (valid bool) {
 	valid = true
 
-	for _, rd := range lastInputOutput.readSet(txIdx) {
+	for _, rd := range lastInputOutput.ReadSet(txIdx) {
 		mvResult := versionedData.Read(rd.Path, txIdx)
 		switch mvResult.Status() {
 		case MVReadResultDone:
