@@ -2,6 +2,9 @@ package blockstm
 
 import (
 	"fmt"
+	"sync"
+
+	"github.com/ethereum/go-ethereum/common"
 )
 
 type ExecResult struct {
@@ -17,12 +20,14 @@ type ExecTask interface {
 	MVReadList() []ReadDescriptor
 	MVWriteList() []WriteDescriptor
 	MVFullWriteList() []WriteDescriptor
+	Sender() common.Address
 }
 
 type ExecVersionView struct {
-	ver Version
-	et  ExecTask
-	mvh *MVHashMap
+	ver    Version
+	et     ExecTask
+	mvh    *MVHashMap
+	sender common.Address
 }
 
 func (ev *ExecVersionView) Execute() (er ExecResult) {
@@ -61,6 +66,13 @@ func ExecuteParallel(tasks []ExecTask) (lastTxIO *TxnInputOutput, err error) {
 	chTasks := make(chan ExecVersionView, len(tasks))
 	chResults := make(chan ExecResult, len(tasks))
 	chDone := make(chan bool)
+	mutMap := map[common.Address]*sync.RWMutex{}
+
+	for _, t := range tasks {
+		if _, ok := mutMap[t.Sender()]; !ok {
+			mutMap[t.Sender()] = &sync.RWMutex{}
+		}
+	}
 
 	var cntExec, cntSuccess, cntAbort, cntTotalValidations, cntValidationFail int
 
@@ -73,11 +85,16 @@ func ExecuteParallel(tasks []ExecTask) (lastTxIO *TxnInputOutput, err error) {
 				select {
 				case task := <-t:
 					{
-						res := task.Execute()
-						if res.err == nil {
-							mvh.FlushMVWriteSet(res.txAllOut)
+						if !mutMap[task.sender].TryLock() {
+							t <- task
+						} else {
+							res := task.Execute()
+							if res.err == nil {
+								mvh.FlushMVWriteSet(res.txAllOut)
+							}
+							chResults <- res
+							mutMap[task.sender].Unlock()
 						}
-						chResults <- res
 					}
 				case <-chDone:
 					break Loop
@@ -95,7 +112,7 @@ func ExecuteParallel(tasks []ExecTask) (lastTxIO *TxnInputOutput, err error) {
 		if tx != -1 {
 			cntExec++
 
-			chTasks <- ExecVersionView{ver: Version{tx, 0}, et: tasks[tx], mvh: mvh}
+			chTasks <- ExecVersionView{ver: Version{tx, 0}, et: tasks[tx], mvh: mvh, sender: tasks[tx].Sender()}
 		}
 	}
 
@@ -162,7 +179,7 @@ func ExecuteParallel(tasks []ExecTask) (lastTxIO *TxnInputOutput, err error) {
 		nextTx := execTasks.takeNextPending()
 		if nextTx != -1 {
 			cntExec++
-			chTasks <- ExecVersionView{ver: Version{nextTx, txIncarnations[nextTx]}, et: tasks[nextTx], mvh: mvh}
+			chTasks <- ExecVersionView{ver: Version{nextTx, txIncarnations[nextTx]}, et: tasks[nextTx], mvh: mvh, sender: tasks[nextTx].Sender()}
 		}
 
 		// do validations ...
@@ -218,7 +235,7 @@ func ExecuteParallel(tasks []ExecTask) (lastTxIO *TxnInputOutput, err error) {
 			if nextTx != -1 {
 				cntExec++
 
-				chTasks <- ExecVersionView{ver: Version{nextTx, txIncarnations[nextTx]}, et: tasks[nextTx], mvh: mvh}
+				chTasks <- ExecVersionView{ver: Version{nextTx, txIncarnations[nextTx]}, et: tasks[nextTx], mvh: mvh, sender: tasks[nextTx].Sender()}
 			}
 		}
 
