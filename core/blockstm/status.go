@@ -11,6 +11,8 @@ func makeStatusManager(numTasks int) (t taskStatusManager) {
 		t.pending[i] = i
 	}
 
+	t.dependency = make(map[int][]int, numTasks)
+
 	return
 }
 
@@ -18,6 +20,7 @@ type taskStatusManager struct {
 	pending    []int
 	inProgress []int
 	complete   []int
+	dependency map[int][]int
 }
 
 func insertInList(l []int, v int) []int {
@@ -111,6 +114,25 @@ func (m *taskStatusManager) countComplete() int {
 func (m *taskStatusManager) revertInProgress(tx int) {
 	m.inProgress = removeFromList(m.inProgress, tx, true)
 	m.pending = insertInList(m.pending, tx)
+}
+
+func (m *taskStatusManager) addDependency(tx int, dependent int) bool {
+	x := sort.SearchInts(m.complete, tx)
+	if x < len(m.complete) && m.complete[x] == tx {
+		// Blocking tx has already completed
+		return false
+	}
+	m.dependency[tx] = append(m.dependency[tx], dependent)
+	return true
+}
+
+func (m *taskStatusManager) removeDependency(tx int) {
+	if deps, ok := m.dependency[tx]; ok && len(deps) > 0 {
+		for _, v := range deps {
+			m.pushPending(v)
+		}
+		delete(m.dependency, tx)
+	}
 }
 
 func (m *taskStatusManager) clearInProgress(tx int) {
