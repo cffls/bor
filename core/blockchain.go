@@ -1750,56 +1750,54 @@ func (bc *BlockChain) insertChain(chain types.Blocks, verifySeals, setHead bool)
 
 		// Process block using the parent state as reference point
 
-		statedb1 := statedb.Copy()
-		statedbSTM := statedb.Copy()
-		statedbSTMGet := statedb.Copy()
-		statedbSTMUse := statedb.Copy()
+		// statedb1 := statedb.Copy()
+		// statedbSTM := statedb.Copy()
+		// statedbSTMGet := statedb.Copy()
+		// statedbSTMUse := statedb.Copy()
 
 		substart := time.Now()
-		receipts, logs, usedGas, err := bc.processor.Process(block, statedb, bc.vmConfig)
+		// receipts, logs, usedGas, err := bc.processor.Process(block, statedb, bc.vmConfig)
 
-		if block.Transactions().Len() >= 20 {
-			substart1 := time.Now()
-			receipts, logs, usedGas, err = bc.processor1.Process(block, statedb1, bc.vmConfig)
-			t1 := time.Now()
-			serialGasTimer.Update(time.Since(substart1))
-			// if usedGas > 0 {
-			// 	serialGasTimer.Update(time.Duration(uint64(usedGas * 1000 / uint64(time.Since(substart1)))))
-			// }
+		// substart1 := time.Now()
+		// receipts, logs, usedGas, err = bc.processor1.Process(block, statedb1, bc.vmConfig)
+		// t1 := time.Now()
+		// serialGasTimer.Update(time.Since(substart1))
+		// if usedGas > 0 {
+		// 	serialGasTimer.Update(time.Duration(uint64(usedGas * 1000 / uint64(time.Since(substart1)))))
+		// }
 
-			receipts, logs, usedGas, err = bc.processorSTMGet.Process(block, statedbSTMGet, bc.vmConfig)
+		receipts, logs, usedGas, err := bc.processorSTMGet.Process(block, statedb, bc.vmConfig)
 
-			t2 := time.Now()
-			receipts, logs, usedGas, err = bc.processorSTM.Process(block, statedbSTM, bc.vmConfig)
-			t3 := time.Now()
-			parallelGasTimer.Update(time.Since(t2))
-			// if usedGas > 0 {
-			// 	parallelGasTimer.Update(time.Duration(uint64(usedGas * 1000 / uint64(time.Since(t2)))))
-			// }
+		// t2 := time.Now()
+		// receipts, logs, usedGas, err = bc.processorSTM.Process(block, statedbSTM, bc.vmConfig)
+		// t3 := time.Now()
+		// parallelGasTimer.Update(time.Since(t2))
+		// // if usedGas > 0 {
+		// // 	parallelGasTimer.Update(time.Duration(uint64(usedGas * 1000 / uint64(time.Since(t2)))))
+		// // }
 
-			t6 := time.Now()
-			receipts, logs, usedGas, err = bc.processorSTMUse.Process(block, statedbSTMUse, bc.vmConfig)
-			t7 := time.Now()
-			parallelMetadataGasTimer.Update(time.Since(t6))
-			// if usedGas > 0 {
-			// 	parallelMetadataGasTimer.Update(time.Duration(uint64(usedGas * 1000 / uint64(time.Since(t6)))))
-			// }
+		// t6 := time.Now()
+		// receipts, logs, usedGas, err = bc.processorSTMUse.Process(block, statedbSTMUse, bc.vmConfig)
+		// t7 := time.Now()
+		// parallelMetadataGasTimer.Update(time.Since(t6))
+		// // if usedGas > 0 {
+		// // 	parallelMetadataGasTimer.Update(time.Duration(uint64(usedGas * 1000 / uint64(time.Since(t6)))))
+		// // }
 
-			log.Info("**** Process block time", "blockNumber", block.Number(), "transactions", block.Transactions().Len(), "Serial first time", t1.Sub(substart1), "STM without dependency", t3.Sub(t2), "STM with dependency", t7.Sub(t6))
+		// log.Info("**** Process block time", "blockNumber", block.Number(), "transactions", block.Transactions().Len(), "Serial first time", t1.Sub(substart1), "STM without dependency", t3.Sub(t2), "STM with dependency", t7.Sub(t6))
 
-			if serialGasTimer.Count()%50 == 0 {
-				log.Info("Histogram of processing time", "serial", serialGasTimer.Percentiles([]float64{0.001, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 0.999, 0.9999}))
-				log.Info("Histogram of processing time", "parallel", parallelGasTimer.Percentiles([]float64{0.001, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 0.999, 0.9999}))
-				log.Info("Histogram of processing time", "parallel metadata", parallelMetadataGasTimer.Percentiles([]float64{0.001, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 0.999, 0.9999}))
+		// if serialGasTimer.Count()%50 == 0 {
+		// 	log.Info("Histogram of processing time", "serial", serialGasTimer.Percentiles([]float64{0.001, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 0.999, 0.9999}))
+		// 	log.Info("Histogram of processing time", "parallel", parallelGasTimer.Percentiles([]float64{0.001, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 0.999, 0.9999}))
+		// 	log.Info("Histogram of processing time", "parallel metadata", parallelMetadataGasTimer.Percentiles([]float64{0.001, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 0.999, 0.9999}))
 
-				log.Info("Average processing time for serial, parallel, and parallel metadata processing", "serial", time.Duration(serialGasTimer.Mean()), "parallel", time.Duration(parallelGasTimer.Mean()), "parallel metadata", time.Duration(parallelMetadataGasTimer.Mean()))
-				log.Info("Average mgasps time for serial and parallel, and parallel metadata processing", "serial", serialGasTimer.Mean(), "parallel", parallelGasTimer.Mean(), "parallel metadata", parallelMetadataGasTimer.Mean())
+		// 	log.Info("Average processing time for serial, parallel, and parallel metadata processing", "serial", time.Duration(serialGasTimer.Mean()), "parallel", time.Duration(parallelGasTimer.Mean()), "parallel metadata", time.Duration(parallelMetadataGasTimer.Mean()))
+		// 	log.Info("Average mgasps time for serial and parallel, and parallel metadata processing", "serial", serialGasTimer.Mean(), "parallel", parallelGasTimer.Mean(), "parallel metadata", parallelMetadataGasTimer.Mean())
 
-				// log.Info("Histogram of mgasps time", "serial", serialGasTimer.Percentiles([]float64{0.001, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 0.999, 0.9999}))
-				// log.Info("Histogram of mgasps time", "parallel", parallelGasTimer.Percentiles([]float64{0.001, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 0.999, 0.9999}))
-				// log.Info("Histogram of mgasps time", "parallel metadata", parallelMetadataGasTimer.Percentiles([]float64{0.001, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 0.999, 0.9999}))
-			}
-		}
+		// 	// log.Info("Histogram of mgasps time", "serial", serialGasTimer.Percentiles([]float64{0.001, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 0.999, 0.9999}))
+		// 	// log.Info("Histogram of mgasps time", "parallel", parallelGasTimer.Percentiles([]float64{0.001, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 0.999, 0.9999}))
+		// 	// log.Info("Histogram of mgasps time", "parallel metadata", parallelMetadataGasTimer.Percentiles([]float64{0.001, 0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9, 0.95, 0.99, 0.999, 0.9999}))
+		// }
 
 		if err != nil {
 			bc.reportBlock(block, receipts, err)

@@ -321,6 +321,9 @@ func (b *Block) ReceiptHash() common.Hash { return b.header.ReceiptHash }
 func (b *Block) UncleHash() common.Hash   { return b.header.UncleHash }
 func (b *Block) Extra() []byte            { return common.CopyBytes(b.header.Extra) }
 func (b *Block) TxDependency() [][]uint64 { return b.header.TxDependency }
+func (b *Block) SetTxDependency(txDependency [][]uint64) {
+	b.header.TxDependency = txDependency
+}
 
 func (b *Block) BaseFee() *big.Int {
 	if b.header.BaseFee == nil {

@@ -475,7 +475,30 @@ func (p *ParallelStateProcessorGet) Process(block *types.Block, statedb *state.S
 
 	}
 
-	block.Dependency = tempRes.AllDeps
+	tempDeps := make([][]uint64, len(tasks))
+
+	for i := 0; i <= len(tasks)-1; i++ {
+		tempDeps[i] = []uint64{uint64(i)}
+
+		reads := tasks[i].(*ExecutionTask).statedb.MVReadMap()
+
+		_, ok1 := reads[blockstm.NewSubpathKey(coinbase, state.BalancePath)]
+		_, ok2 := reads[blockstm.NewSubpathKey(tasks[i].(*ExecutionTask).result.BurntContractAddress, state.BalancePath)]
+
+		if ok1 || ok2 {
+			// 0 -> delay is not allowed
+			tempDeps[i] = append(tempDeps[i], 0)
+		} else {
+			// 1 -> delay is allowed
+			tempDeps[i] = append(tempDeps[i], 1)
+		}
+
+		for j := range tempRes.AllDeps[i] {
+			tempDeps[i] = append(tempDeps[i], uint64(j))
+		}
+	}
+
+	block.SetTxDependency(tempDeps)
 
 	if err != nil {
 		log.Error("blockstm error executing block", "err", err)
@@ -513,6 +536,24 @@ func NewParallelStateProcessorUse(config *params.ChainConfig, bc *BlockChain, en
 	}
 }
 
+func GetDeps(txDependency [][]uint64) (map[int][]int, map[int]bool) {
+	deps := make(map[int][]int)
+	delayMap := make(map[int]bool)
+
+	for i := 0; i <= len(txDependency)-1; i++ {
+		idx := int(txDependency[i][0])
+		shouldDelay := txDependency[i][1] == 1
+
+		delayMap[idx] = shouldDelay
+
+		for j := 2; j <= len(txDependency[i])-1; j++ {
+			deps[idx] = append(deps[idx], int(txDependency[i][j]))
+		}
+	}
+
+	return deps, delayMap
+}
+
 // Process processes the state changes according to the Ethereum rules by running
 // the transaction messages using the statedb and applying any rewards to both
 // the processor (coinbase) and any included uncles.
@@ -541,6 +582,8 @@ func (p *ParallelStateProcessorUse) Process(block *types.Block, statedb *state.S
 	shouldDelayFeeCal := true
 
 	coinbase, _ := p.bc.Engine().Author(header)
+
+	deps, _ := GetDeps(block.TxDependency())
 
 	// Iterate over and process the individual transactions
 	for i, tx := range block.Transactions() {
@@ -574,7 +617,7 @@ func (p *ParallelStateProcessorUse) Process(block *types.Block, statedb *state.S
 			totalUsedGas:      usedGas,
 			receipts:          &receipts,
 			allLogs:           &allLogs,
-			dependencies:      block.Dependency[i],
+			dependencies:      deps[i],
 		}
 
 		tasks = append(tasks, task)
