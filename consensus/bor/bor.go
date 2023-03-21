@@ -472,10 +472,11 @@ func (c *Bor) verifyCascadingFields(chain consensus.ChainHeaderReader, header *t
 
 		for newValidators, err = c.spanner.GetCurrentValidators(context.Background(), chain.GetHeaderByNumber(parentBlockNumber).Hash(), number+1); err != nil && parentBlockNumber > 0; {
 			parentBlockNumber--
+			newValidators, err = c.spanner.GetCurrentValidators(context.Background(), chain.GetHeaderByNumber(parentBlockNumber).Hash(), number+1)
 		}
 
 		if err != nil {
-			return errUnknownValidators
+			return err
 		}
 
 		sort.Sort(valset.ValidatorsByAddress(newValidators))
