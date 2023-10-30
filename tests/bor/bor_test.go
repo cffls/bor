@@ -409,6 +409,7 @@ func TestInsertingSpanSizeBlocks(t *testing.T) {
 
 	// Insert sprintSize # of blocks so that span is fetched at the start of a new sprint
 	for i := uint64(1); i <= spanSize; i++ {
+		fmt.Println("block number", i)
 		block = buildNextBlock(t, _bor, chain, block, nil, init.genesis.Config.Bor, nil, currentValidators)
 		insertNewBlock(t, chain, block)
 	}
