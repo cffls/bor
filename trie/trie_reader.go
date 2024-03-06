@@ -20,7 +20,21 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
+<<<<<<< Updated upstream
+=======
+	"github.com/ethereum/go-ethereum/metrics"
+	"github.com/ethereum/go-ethereum/trie/triestate"
+>>>>>>> Stashed changes
 )
+
+var trieNodeMeter = metrics.NewRegisteredMeter("trie/node/read", nil)
+var trieNodeMeter10 = metrics.NewRegisteredMeter("trie/node/read10", nil)
+var trieNodeMeter100 = metrics.NewRegisteredMeter("trie/node/read100", nil)
+var trieNodeMeter1000 = metrics.NewRegisteredMeter("trie/node/read1000", nil)
+var trieNodeMeter10000 = metrics.NewRegisteredMeter("trie/node/read10000", nil)
+var trieNodeMeter100000 = metrics.NewRegisteredMeter("trie/node/read100000", nil)
+var trieNodeMeter1000000 = metrics.NewRegisteredMeter("trie/node/read1000000", nil)
+var trieNodeMeter10000000 = metrics.NewRegisteredMeter("trie/node/read10000000", nil)
 
 // Reader wraps the Node method of a backing trie store.
 type Reader interface {
@@ -38,9 +52,10 @@ type Reader interface {
 // trieReader is a wrapper of the underlying node reader. It's not safe
 // for concurrent usage.
 type trieReader struct {
-	owner  common.Hash
-	reader Reader
-	banned map[string]struct{} // Marker to prevent node from being accessed, for tests
+	owner      common.Hash
+	reader     Reader
+	banned     map[string]struct{} // Marker to prevent node from being accessed, for tests
+	nodeHitMap map[string]int
 }
 
 // newTrieReader initializes the trie reader with the given node reader.
@@ -49,14 +64,14 @@ func newTrieReader(stateRoot, owner common.Hash, db *Database) (*trieReader, err
 		if stateRoot == (common.Hash{}) {
 			log.Error("Zero state root hash!")
 		}
-		return &trieReader{owner: owner}, nil
+		return &trieReader{owner: owner, nodeHitMap: make(map[string]int)}, nil
 	}
 	reader, err := db.Reader(stateRoot)
 	if err != nil {
 		return nil, &MissingNodeError{Owner: owner, NodeHash: stateRoot, err: err}
 	}
 
-	return &trieReader{owner: owner, reader: reader}, nil
+	return &trieReader{owner: owner, reader: reader, nodeHitMap: make(map[string]int)}, nil
 }
 
 // newEmptyReader initializes the pure in-memory reader. All read operations
@@ -82,6 +97,36 @@ func (r *trieReader) node(path []byte, hash common.Hash) ([]byte, error) {
 	blob, err := r.reader.Node(r.owner, path, hash)
 	if err != nil || len(blob) == 0 {
 		return nil, &MissingNodeError{Owner: r.owner, NodeHash: hash, Path: path, err: err}
+	}
+
+	var fullPath string
+
+	if r.owner == (common.Hash{}) {
+		fullPath = string(path)
+	} else {
+		fullPath = r.owner.Hex() + string(common.Bytes2Hex(path))
+	}
+
+	if r.nodeHitMap[fullPath] == 0 {
+		trieNodeMeter.Mark(1)
+	}
+
+	r.nodeHitMap[fullPath] += 1
+
+	if r.nodeHitMap[fullPath] == 10 {
+		trieNodeMeter10.Mark(1)
+	} else if r.nodeHitMap[fullPath] == 100 {
+		trieNodeMeter100.Mark(1)
+	} else if r.nodeHitMap[fullPath] == 1000 {
+		trieNodeMeter1000.Mark(1)
+	} else if r.nodeHitMap[fullPath] == 10000 {
+		trieNodeMeter10000.Mark(1)
+	} else if r.nodeHitMap[fullPath] == 100000 {
+		trieNodeMeter100000.Mark(1)
+	} else if r.nodeHitMap[fullPath] == 1000000 {
+		trieNodeMeter1000000.Mark(1)
+	} else if r.nodeHitMap[fullPath] == 10000000 {
+		trieNodeMeter10000000.Mark(1)
 	}
 
 	return blob, nil
