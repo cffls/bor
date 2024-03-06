@@ -17,6 +17,8 @@
 package trie
 
 import (
+	"sync"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
@@ -48,10 +50,11 @@ type Reader interface {
 // trieReader is a wrapper of the underlying node reader. It's not safe
 // for concurrent usage.
 type trieReader struct {
-	owner      common.Hash
-	reader     Reader
-	banned     map[string]struct{} // Marker to prevent node from being accessed, for tests
-	nodeHitMap map[string]int
+	owner           common.Hash
+	reader          Reader
+	banned          map[string]struct{} // Marker to prevent node from being accessed, for tests
+	nodeHitMap      map[string]int
+	nodeHitMapMutex sync.Mutex
 }
 
 // newTrieReader initializes the trie reader with the given node reader.
@@ -60,14 +63,14 @@ func newTrieReader(stateRoot, owner common.Hash, db *Database) (*trieReader, err
 		if stateRoot == (common.Hash{}) {
 			log.Error("Zero state root hash!")
 		}
-		return &trieReader{owner: owner, nodeHitMap: make(map[string]int)}, nil
+		return &trieReader{owner: owner, nodeHitMap: make(map[string]int), nodeHitMapMutex: sync.Mutex{}}, nil
 	}
 	reader, err := db.Reader(stateRoot)
 	if err != nil {
 		return nil, &MissingNodeError{Owner: owner, NodeHash: stateRoot, err: err}
 	}
 
-	return &trieReader{owner: owner, reader: reader, nodeHitMap: make(map[string]int)}, nil
+	return &trieReader{owner: owner, reader: reader, nodeHitMap: make(map[string]int), nodeHitMapMutex: sync.Mutex{}}, nil
 }
 
 // newEmptyReader initializes the pure in-memory reader. All read operations
@@ -102,6 +105,9 @@ func (r *trieReader) node(path []byte, hash common.Hash) ([]byte, error) {
 	} else {
 		fullPath = r.owner.Hex() + string(common.Bytes2Hex(path))
 	}
+
+	r.nodeHitMapMutex.Lock()
+	defer r.nodeHitMapMutex.Unlock()
 
 	if r.nodeHitMap[fullPath] == 0 {
 		trieNodeMeter.Mark(1)
