@@ -20,11 +20,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
-<<<<<<< Updated upstream
-=======
 	"github.com/ethereum/go-ethereum/metrics"
-	"github.com/ethereum/go-ethereum/trie/triestate"
->>>>>>> Stashed changes
 )
 
 var trieNodeMeter = metrics.NewRegisteredMeter("trie/node/read", nil)
