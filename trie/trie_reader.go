@@ -33,6 +33,8 @@ var trieNodeMeter10000 = metrics.NewRegisteredMeter("trie/node/read10000", nil)
 var trieNodeMeter100000 = metrics.NewRegisteredMeter("trie/node/read100000", nil)
 var trieNodeMeter1000000 = metrics.NewRegisteredMeter("trie/node/read1000000", nil)
 var trieNodeMeter10000000 = metrics.NewRegisteredMeter("trie/node/read10000000", nil)
+var nodeHitMap = make(map[string]int)
+var nodeHitMapMutex = sync.Mutex{}
 
 // Reader wraps the Node method of a backing trie store.
 type Reader interface {
@@ -50,11 +52,9 @@ type Reader interface {
 // trieReader is a wrapper of the underlying node reader. It's not safe
 // for concurrent usage.
 type trieReader struct {
-	owner           common.Hash
-	reader          Reader
-	banned          map[string]struct{} // Marker to prevent node from being accessed, for tests
-	nodeHitMap      map[string]int
-	nodeHitMapMutex sync.Mutex
+	owner  common.Hash
+	reader Reader
+	banned map[string]struct{} // Marker to prevent node from being accessed, for tests
 }
 
 // newTrieReader initializes the trie reader with the given node reader.
@@ -63,14 +63,14 @@ func newTrieReader(stateRoot, owner common.Hash, db *Database) (*trieReader, err
 		if stateRoot == (common.Hash{}) {
 			log.Error("Zero state root hash!")
 		}
-		return &trieReader{owner: owner, nodeHitMap: make(map[string]int), nodeHitMapMutex: sync.Mutex{}}, nil
+		return &trieReader{owner: owner}, nil
 	}
 	reader, err := db.Reader(stateRoot)
 	if err != nil {
 		return nil, &MissingNodeError{Owner: owner, NodeHash: stateRoot, err: err}
 	}
 
-	return &trieReader{owner: owner, reader: reader, nodeHitMap: make(map[string]int), nodeHitMapMutex: sync.Mutex{}}, nil
+	return &trieReader{owner: owner, reader: reader}, nil
 }
 
 // newEmptyReader initializes the pure in-memory reader. All read operations
@@ -106,28 +106,28 @@ func (r *trieReader) node(path []byte, hash common.Hash) ([]byte, error) {
 		fullPath = r.owner.Hex() + string(common.Bytes2Hex(path))
 	}
 
-	r.nodeHitMapMutex.Lock()
-	defer r.nodeHitMapMutex.Unlock()
+	nodeHitMapMutex.Lock()
+	defer nodeHitMapMutex.Unlock()
 
-	if r.nodeHitMap[fullPath] == 0 {
+	if nodeHitMap[fullPath] == 0 {
 		trieNodeMeter.Mark(1)
 	}
 
-	r.nodeHitMap[fullPath] += 1
+	nodeHitMap[fullPath] += 1
 
-	if r.nodeHitMap[fullPath] == 10 {
+	if nodeHitMap[fullPath] == 10 {
 		trieNodeMeter10.Mark(1)
-	} else if r.nodeHitMap[fullPath] == 100 {
+	} else if nodeHitMap[fullPath] == 100 {
 		trieNodeMeter100.Mark(1)
-	} else if r.nodeHitMap[fullPath] == 1000 {
+	} else if nodeHitMap[fullPath] == 1000 {
 		trieNodeMeter1000.Mark(1)
-	} else if r.nodeHitMap[fullPath] == 10000 {
+	} else if nodeHitMap[fullPath] == 10000 {
 		trieNodeMeter10000.Mark(1)
-	} else if r.nodeHitMap[fullPath] == 100000 {
+	} else if nodeHitMap[fullPath] == 100000 {
 		trieNodeMeter100000.Mark(1)
-	} else if r.nodeHitMap[fullPath] == 1000000 {
+	} else if nodeHitMap[fullPath] == 1000000 {
 		trieNodeMeter1000000.Mark(1)
-	} else if r.nodeHitMap[fullPath] == 10000000 {
+	} else if nodeHitMap[fullPath] == 10000000 {
 		trieNodeMeter10000000.Mark(1)
 	}
 
