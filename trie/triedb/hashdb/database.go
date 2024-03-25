@@ -17,7 +17,6 @@
 package hashdb
 
 import (
-	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -661,16 +660,16 @@ func (reader *reader) Node(owner common.Hash, path []byte, hash common.Hash) ([]
 
 	data, err := reader.db.diskdb.Get(fullPath)
 	if err != nil {
-		var bufVarLen bytes.Buffer
-		n := binary.PutUvarint(bufVarLen.Bytes()[0:], 1)
-		reader.db.diskdb.Put(fullPath, bufVarLen.Bytes()[:n])
+		var bufFixedLenBigEndian [8]byte
+		n := binary.PutUvarint(bufFixedLenBigEndian[0:], 1)
+		reader.db.diskdb.Put(fullPath, bufFixedLenBigEndian[:n])
 		trieNodeMeter.Mark(1)
 	} else {
 		count, _ := binary.Uvarint(data)
 		count++
-		var bufVarLen bytes.Buffer
-		n := binary.PutUvarint(bufVarLen.Bytes()[0:], count)
-		reader.db.diskdb.Put(fullPath, bufVarLen.Bytes()[:n])
+		var bufFixedLenBigEndian [8]byte
+		n := binary.PutUvarint(bufFixedLenBigEndian[0:], count)
+		reader.db.diskdb.Put(fullPath, bufFixedLenBigEndian[:n])
 	}
 
 	blob, _ := reader.db.Node(hash)
