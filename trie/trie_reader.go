@@ -17,24 +17,21 @@
 package trie
 
 import (
-	"sync"
-
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/log"
-	"github.com/ethereum/go-ethereum/metrics"
 )
 
-var trieNodeMeter = metrics.NewRegisteredMeter("trie/node/read", nil)
-var trieNodeMeter10 = metrics.NewRegisteredMeter("trie/node/read10", nil)
-var trieNodeMeter100 = metrics.NewRegisteredMeter("trie/node/read100", nil)
-var trieNodeMeter1000 = metrics.NewRegisteredMeter("trie/node/read1000", nil)
-var trieNodeMeter10000 = metrics.NewRegisteredMeter("trie/node/read10000", nil)
-var trieNodeMeter100000 = metrics.NewRegisteredMeter("trie/node/read100000", nil)
-var trieNodeMeter1000000 = metrics.NewRegisteredMeter("trie/node/read1000000", nil)
-var trieNodeMeter10000000 = metrics.NewRegisteredMeter("trie/node/read10000000", nil)
-var nodeHitMap = make(map[string]int)
-var nodeHitMapMutex = sync.Mutex{}
+// var trieNodeMeter = metrics.NewRegisteredMeter("trie/node/read", nil)
+// var trieNodeMeter10 = metrics.NewRegisteredMeter("trie/node/read10", nil)
+// var trieNodeMeter100 = metrics.NewRegisteredMeter("trie/node/read100", nil)
+// var trieNodeMeter1000 = metrics.NewRegisteredMeter("trie/node/read1000", nil)
+// var trieNodeMeter10000 = metrics.NewRegisteredMeter("trie/node/read10000", nil)
+// var trieNodeMeter100000 = metrics.NewRegisteredMeter("trie/node/read100000", nil)
+// var trieNodeMeter1000000 = metrics.NewRegisteredMeter("trie/node/read1000000", nil)
+// var trieNodeMeter10000000 = metrics.NewRegisteredMeter("trie/node/read10000000", nil)
+// var nodeHitMap = make(map[string]int)
+// var nodeHitMapMutex = sync.Mutex{}
 
 // Reader wraps the Node method of a backing trie store.
 type Reader interface {
@@ -98,38 +95,38 @@ func (r *trieReader) node(path []byte, hash common.Hash) ([]byte, error) {
 		return nil, &MissingNodeError{Owner: r.owner, NodeHash: hash, Path: path, err: err}
 	}
 
-	var fullPath string
+	// var fullPath string
 
-	if r.owner == (common.Hash{}) {
-		fullPath = string(path)
-	} else {
-		fullPath = r.owner.Hex() + string(common.Bytes2Hex(path))
-	}
+	// if r.owner == (common.Hash{}) {
+	// 	fullPath = string(path)
+	// } else {
+	// 	fullPath = r.owner.Hex() + string(common.Bytes2Hex(path))
+	// }
 
-	nodeHitMapMutex.Lock()
-	defer nodeHitMapMutex.Unlock()
+	// nodeHitMapMutex.Lock()
+	// defer nodeHitMapMutex.Unlock()
 
-	if nodeHitMap[fullPath] == 0 {
-		trieNodeMeter.Mark(1)
-	}
+	// if nodeHitMap[fullPath] == 0 {
+	// 	trieNodeMeter.Mark(1)
+	// }
 
-	nodeHitMap[fullPath] += 1
+	// nodeHitMap[fullPath] += 1
 
-	if nodeHitMap[fullPath] == 10 {
-		trieNodeMeter10.Mark(1)
-	} else if nodeHitMap[fullPath] == 100 {
-		trieNodeMeter100.Mark(1)
-	} else if nodeHitMap[fullPath] == 1000 {
-		trieNodeMeter1000.Mark(1)
-	} else if nodeHitMap[fullPath] == 10000 {
-		trieNodeMeter10000.Mark(1)
-	} else if nodeHitMap[fullPath] == 100000 {
-		trieNodeMeter100000.Mark(1)
-	} else if nodeHitMap[fullPath] == 1000000 {
-		trieNodeMeter1000000.Mark(1)
-	} else if nodeHitMap[fullPath] == 10000000 {
-		trieNodeMeter10000000.Mark(1)
-	}
+	// if nodeHitMap[fullPath] == 10 {
+	// 	trieNodeMeter10.Mark(1)
+	// } else if nodeHitMap[fullPath] == 100 {
+	// 	trieNodeMeter100.Mark(1)
+	// } else if nodeHitMap[fullPath] == 1000 {
+	// 	trieNodeMeter1000.Mark(1)
+	// } else if nodeHitMap[fullPath] == 10000 {
+	// 	trieNodeMeter10000.Mark(1)
+	// } else if nodeHitMap[fullPath] == 100000 {
+	// 	trieNodeMeter100000.Mark(1)
+	// } else if nodeHitMap[fullPath] == 1000000 {
+	// 	trieNodeMeter1000000.Mark(1)
+	// } else if nodeHitMap[fullPath] == 10000000 {
+	// 	trieNodeMeter10000000.Mark(1)
+	// }
 
 	return blob, nil
 }

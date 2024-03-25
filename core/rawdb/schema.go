@@ -108,9 +108,10 @@ var (
 	skeletonHeaderPrefix  = []byte("S") // skeletonHeaderPrefix + num (uint64 big endian) -> header
 
 	// Path-based storage scheme of merkle patricia trie.
-	trieNodeAccountPrefix = []byte("A") // trieNodeAccountPrefix + hexPath -> trie node
-	trieNodeStoragePrefix = []byte("O") // trieNodeStoragePrefix + accountHash + hexPath -> trie node
-	stateIDPrefix         = []byte("L") // stateIDPrefix + state root -> state id
+	trieNodeAccountPrefix         = []byte("A") // trieNodeAccountPrefix + hexPath -> trie node
+	trieNodeStoragePrefix         = []byte("O") // trieNodeStoragePrefix + accountHash + hexPath -> trie node
+	stateIDPrefix                 = []byte("L") // stateIDPrefix + state root -> state id
+	trieNodeAccessedCounterPrefix = []byte("N")
 
 	PreimagePrefix = []byte("secure-key-")       // PreimagePrefix + hash -> preimage
 	configPrefix   = []byte("ethereum-config-")  // config prefix for the db

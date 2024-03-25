@@ -17,6 +17,8 @@
 package hashdb
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"reflect"
@@ -57,6 +59,7 @@ var (
 	memcacheCommitTimeTimer  = metrics.NewRegisteredResettingTimer("hashdb/memcache/commit/time", nil)
 	memcacheCommitNodesMeter = metrics.NewRegisteredMeter("hashdb/memcache/commit/nodes", nil)
 	memcacheCommitBytesMeter = metrics.NewRegisteredMeter("hashdb/memcache/commit/bytes", nil)
+	trieNodeMeter            = metrics.NewRegisteredMeter("trie/node/read", nil)
 )
 
 // ChildResolver defines the required method to decode the provided
@@ -645,6 +648,31 @@ type reader struct {
 // Node retrieves the trie node with the given node hash.
 // No error will be returned if the node is not found.
 func (reader *reader) Node(owner common.Hash, path []byte, hash common.Hash) ([]byte, error) {
+	var fullPath []byte
+
+	prefix := []byte("N")
+
+	if owner == (common.Hash{}) {
+		fullPath = append(prefix, path...)
+	} else {
+		fullPath = append(prefix, owner.Bytes()...)
+		fullPath = append(fullPath, path...)
+	}
+
+	data, err := reader.db.diskdb.Get(fullPath)
+	if err != nil {
+		var bufVarLen bytes.Buffer
+		n := binary.PutUvarint(bufVarLen.Bytes()[0:], 1)
+		reader.db.diskdb.Put(fullPath, bufVarLen.Bytes()[:n])
+		trieNodeMeter.Mark(1)
+	} else {
+		count, _ := binary.Uvarint(data)
+		count++
+		var bufVarLen bytes.Buffer
+		n := binary.PutUvarint(bufVarLen.Bytes()[0:], count)
+		reader.db.diskdb.Put(fullPath, bufVarLen.Bytes()[:n])
+	}
+
 	blob, _ := reader.db.Node(hash)
 	return blob, nil
 }
