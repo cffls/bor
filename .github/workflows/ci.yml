@@ -5,6 +5,7 @@ on:
       - "master"
       - "qa"
       - "develop"
+      - "upstream_merge_1.14.6"
   pull_request:
     branches:
       - "**"
