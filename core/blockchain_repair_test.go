@@ -266,11 +266,9 @@ func testShortOldForkedSnapSyncedRepair(t *testing.T, snapshots bool) {
 // the chain to detect that it was fast syncing and not delete anything, since we
 // can just pick up directly where we left off.
 func TestShortOldForkedSnapSyncingRepair(t *testing.T) {
-	t.Skip("snap sync not supported in bor")
 	testShortOldForkedSnapSyncingRepair(t, false)
 }
 func TestShortOldForkedSnapSyncingRepairWithSnapshots(t *testing.T) {
-	t.Skip("snap sync not supported in bor")
 	testShortOldForkedSnapSyncingRepair(t, true)
 }
 
@@ -414,7 +412,6 @@ func TestShortNewlyForkedSnapSyncingRepairWithSnapshots(t *testing.T) {
 }
 
 func testShortNewlyForkedSnapSyncingRepair(t *testing.T, snapshots bool) {
-	t.Skip("snap sync not supported in bor")
 	// Chain:
 	//   G->C1->C2->C3->C4->C5->C6->C7->C8 (HEAD)
 	//   └->S1->S2->S3->S4->S5->S6
@@ -551,7 +548,6 @@ func TestShortReorgedSnapSyncingRepairWithSnapshots(t *testing.T) {
 }
 
 func testShortReorgedSnapSyncingRepair(t *testing.T, snapshots bool) {
-	t.Skip("snap sync not supported in bor")
 	// Chain:
 	//   G->C1->C2->C3->C4->C5->C6->C7->C8 (HEAD)
 	//   └->S1->S2->S3->S4->S5->S6->S7->S8->S9->S10
@@ -789,7 +785,6 @@ func TestLongSnapSyncingShallowRepairWithSnapshots(t *testing.T) {
 }
 
 func testLongSnapSyncingShallowRepair(t *testing.T, snapshots bool) {
-	t.Skip("snap sync not supported in bor")
 	// Chain:
 	//   G->C1->C2->C3->C4->C5->C6->C7->C8->C9->C10->C11->C12->C13->C14->C15->C16->C17->C18 (HEAD)
 	//
@@ -836,7 +831,6 @@ func TestLongSnapSyncingDeepRepair(t *testing.T)              { testLongSnapSync
 func TestLongSnapSyncingDeepRepairWithSnapshots(t *testing.T) { testLongSnapSyncingDeepRepair(t, true) }
 
 func testLongSnapSyncingDeepRepair(t *testing.T, snapshots bool) {
-	t.Skip("snap sync not supported in bor")
 	// Chain:
 	//   G->C1->C2->C3->C4->C5->C6->C7->C8->C9->C10->C11->C12->C13->C14->C15->C16->C17->C18->C19->C20->C21->C22->C23->C24 (HEAD)
 	//
@@ -980,14 +974,15 @@ func testLongOldForkedDeepRepair(t *testing.T, snapshots bool) {
 // to be rolled back to the committed block, with everything afterwards kept as
 // fast sync data; the side chain completely nuked by the freezer.
 func TestLongOldForkedSnapSyncedShallowRepair(t *testing.T) {
+	t.Skip("snap sync not supported in bor")
 	testLongOldForkedSnapSyncedShallowRepair(t, false)
 }
 func TestLongOldForkedSnapSyncedShallowRepairWithSnapshots(t *testing.T) {
+	t.Skip("snap sync not supported in bor")
 	testLongOldForkedSnapSyncedShallowRepair(t, true)
 }
 
 func testLongOldForkedSnapSyncedShallowRepair(t *testing.T, snapshots bool) {
-	t.Skip("snap sync not supported in bor")
 	// Chain:
 	//   G->C1->C2->C3->C4->C5->C6->C7->C8->C9->C10->C11->C12->C13->C14->C15->C16->C17->C18 (HEAD)
 	//   └->S1->S2->S3
@@ -1093,7 +1088,6 @@ func TestLongOldForkedSnapSyncingShallowRepairWithSnapshots(t *testing.T) {
 }
 
 func testLongOldForkedSnapSyncingShallowRepair(t *testing.T, snapshots bool) {
-	t.Skip("snap sync not supported in bor")
 	// Chain:
 	//   G->C1->C2->C3->C4->C5->C6->C7->C8->C9->C10->C11->C12->C13->C14->C15->C16->C17->C18 (HEAD)
 	//   └->S1->S2->S3
@@ -1146,7 +1140,6 @@ func TestLongOldForkedSnapSyncingDeepRepairWithSnapshots(t *testing.T) {
 }
 
 func testLongOldForkedSnapSyncingDeepRepair(t *testing.T, snapshots bool) {
-	t.Skip("snap sync not supported in bor")
 	// Chain:
 	//   G->C1->C2->C3->C4->C5->C6->C7->C8->C9->C10->C11->C12->C13->C14->C15->C16->C17->C18->C19->C20->C21->C22->C23->C24 (HEAD)
 	//   └->S1->S2->S3
@@ -1405,7 +1398,6 @@ func TestLongNewerForkedSnapSyncingShallowRepairWithSnapshots(t *testing.T) {
 }
 
 func testLongNewerForkedSnapSyncingShallowRepair(t *testing.T, snapshots bool) {
-	t.Skip("snap sync not supported in bor")
 	// Chain:
 	//   G->C1->C2->C3->C4->C5->C6->C7->C8->C9->C10->C11->C12->C13->C14->C15->C16->C17->C18 (HEAD)
 	//   └->S1->S2->S3->S4->S5->S6->S7->S8->S9->S10->S11->S12
@@ -1458,7 +1450,6 @@ func TestLongNewerForkedSnapSyncingDeepRepairWithSnapshots(t *testing.T) {
 }
 
 func testLongNewerForkedSnapSyncingDeepRepair(t *testing.T, snapshots bool) {
-	t.Skip("snap sync not supported in bor")
 	// Chain:
 	//   G->C1->C2->C3->C4->C5->C6->C7->C8->C9->C10->C11->C12->C13->C14->C15->C16->C17->C18->C19->C20->C21->C22->C23->C24 (HEAD)
 	//   └->S1->S2->S3->S4->S5->S6->S7->S8->S9->S10->S11->S12
@@ -1709,7 +1700,6 @@ func TestLongReorgedSnapSyncingShallowRepairWithSnapshots(t *testing.T) {
 }
 
 func testLongReorgedSnapSyncingShallowRepair(t *testing.T, snapshots bool) {
-	t.Skip("snap sync not supported in bor")
 	// Chain:
 	//   G->C1->C2->C3->C4->C5->C6->C7->C8->C9->C10->C11->C12->C13->C14->C15->C16->C17->C18 (HEAD)
 	//   └->S1->S2->S3->S4->S5->S6->S7->S8->S9->S10->S11->S12->S13->S14->S15->S16->S17->S18->S19->S20->S21->S22->S23->S24->S25->S26
@@ -1761,7 +1751,6 @@ func TestLongReorgedSnapSyncingDeepRepairWithSnapshots(t *testing.T) {
 }
 
 func testLongReorgedSnapSyncingDeepRepair(t *testing.T, snapshots bool) {
-	t.Skip("snap sync not supported in bor")
 	// Chain:
 	//   G->C1->C2->C3->C4->C5->C6->C7->C8->C9->C10->C11->C12->C13->C14->C15->C16->C17->C18->C19->C20->C21->C22->C23->C24 (HEAD)
 	//   └->S1->S2->S3->S4->S5->S6->S7->S8->S9->S10->S11->S12->S13->S14->S15->S16->S17->S18->S19->S20->S21->S22->S23->S24->S25->S26
