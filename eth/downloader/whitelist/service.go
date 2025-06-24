@@ -3,6 +3,7 @@ package whitelist
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
@@ -17,6 +18,12 @@ var (
 	ErrCheckpointMismatch = errors.New("checkpoint mismatch")
 	ErrLongFutureChain    = errors.New("received future chain of unacceptable length")
 	ErrNoRemoteCheckpoint = errors.New("remote peer doesn't have a checkpoint")
+)
+
+const (
+	// milestoneGracePeriod defines how long to skip validation after milestone processing
+	// to allow network propagation of websocket milestone updates
+	milestoneGracePeriod = 30 * time.Second
 )
 
 type Service struct {
@@ -81,6 +88,7 @@ func NewService(db ethdb.Database) *Service {
 			FutureMilestoneList:   list,
 			FutureMilestoneOrder:  order,
 			MaxCapacity:           10,
+			gracePeriod:           milestoneGracePeriod,
 		},
 	}
 }

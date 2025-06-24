@@ -7,6 +7,7 @@ import (
 	"math/big"
 	"reflect"
 	"sort"
+	"sync"
 	"testing"
 	"time"
 
@@ -20,7 +21,7 @@ import (
 	"github.com/ethereum/go-ethereum/ethdb"
 )
 
-// NewMockService creates a new mock whitelist service
+// NewMockService creates a new mock whitelist service without grace period
 func NewMockService(db ethdb.Database) *Service {
 	return &Service{
 
@@ -42,6 +43,9 @@ func NewMockService(db ethdb.Database) *Service {
 			FutureMilestoneList:  make(map[uint64]common.Hash),
 			FutureMilestoneOrder: make([]uint64, 0),
 			MaxCapacity:          10,
+			// Set grace period to 0 for mock service to disable grace period behavior
+			// This ensures existing tests continue to work as expected
+			gracePeriod:          0,
 		},
 	}
 }
@@ -686,6 +690,8 @@ func TestPropertyBasedTestingMilestone(t *testing.T) {
 			FutureMilestoneList:   make(map[uint64]common.Hash),
 			FutureMilestoneOrder:  make([]uint64, 0),
 			MaxCapacity:           10,
+			// Set grace period to 0 for property test to disable grace period behavior
+			gracePeriod:           0,
 		}
 
 		var (
@@ -1149,4 +1155,154 @@ func addTestCaseParams(mXNM map[int]map[int]map[int]struct{}, x, n, m int) {
 	}
 
 	mXNM[x][n][m] = struct{}{}
+}
+
+// NewTestServiceWithGracePeriod creates a service with custom grace period for testing
+func NewTestServiceWithGracePeriod(db ethdb.Database, gracePeriod time.Duration) *Service {
+	service := NewService(db)
+	milestone := service.milestoneService.(*milestone)
+	milestone.gracePeriod = gracePeriod
+	return service
+}
+
+// TestMilestoneGracePeriod tests the grace period functionality for milestone validation
+func TestMilestoneGracePeriod(t *testing.T) {
+	t.Parallel()
+
+	db := rawdb.NewMemoryDatabase()
+	s := NewTestServiceWithGracePeriod(db, milestoneGracePeriod)
+
+	// Add a milestone to make validation meaningful
+	s.ProcessMilestone(uint64(100), common.Hash{1})
+
+	milestone := s.milestoneService.(*milestone)
+	require.Equal(t, milestone.doExist, true, "expected milestone to exist")
+
+	// Mock fetchHeadersByNumber that returns mismatched hash (should normally fail validation)
+	fetchHeadersByNumber := func(number uint64, _ int, _ int, _ bool) ([]*types.Header, []common.Hash, error) {
+		header := &types.Header{Number: big.NewInt(int64(number))}
+		// Return wrong hash to simulate mismatch
+		wrongHash := common.Hash{2} // Different from the hash we stored (Hash{1})
+		return []*types.Header{header}, []common.Hash{wrongHash}, nil
+	}
+
+	// Test 1: Without grace period (should fail due to mismatch)
+	// Wait for grace period to expire by manually setting an old timestamp
+	milestone.processingMu.Lock()
+	milestone.lastProcessedAt = time.Now().Add(-milestoneGracePeriod - time.Second)
+	milestone.processingMu.Unlock()
+
+	res, err := milestone.IsValidPeer(fetchHeadersByNumber)
+	require.Equal(t, ErrMismatch, err, "expected mismatch error when grace period expired")
+	require.False(t, res, "expected peer validation to fail when grace period expired")
+
+	// Test 2: Within grace period (should pass despite mismatch)
+	milestone.processingMu.Lock()
+	milestone.lastProcessedAt = time.Now() // Reset to current time
+	milestone.processingMu.Unlock()
+
+	res, err = milestone.IsValidPeer(fetchHeadersByNumber)
+	require.NoError(t, err, "expected no error during grace period")
+	require.True(t, res, "expected peer validation to pass during grace period")
+
+	// Test 3: Chain validation within grace period
+	// Create a chain that includes the milestone block but with wrong hash
+	chain := createMockChain(95, 105) // Create chain with blocks 95-105 (includes block 100)
+	currentHeader := &types.Header{Number: big.NewInt(110)} // Current head is ahead
+
+	// First, test without grace period (should fail due to hash mismatch)
+	milestone.processingMu.Lock()
+	milestone.lastProcessedAt = time.Now().Add(-milestoneGracePeriod - time.Second)
+	milestone.processingMu.Unlock()
+
+	res, err = milestone.IsValidChain(currentHeader, chain)
+	require.NoError(t, err, "expected no error but validation should fail")
+	require.False(t, res, "expected chain validation to fail when grace period expired due to hash mismatch")
+
+	// Test 4: Chain validation within grace period (should pass despite hash mismatch)
+	milestone.processingMu.Lock()
+	milestone.lastProcessedAt = time.Now() // Reset to current time
+	milestone.processingMu.Unlock()
+
+	res, err = milestone.IsValidChain(currentHeader, chain)
+	require.NoError(t, err, "expected no error during grace period")
+	require.True(t, res, "expected chain validation to pass during grace period despite hash mismatch")
+}
+
+// TestMilestoneProcessUpdatesTimestamp tests that Process() updates the timestamp
+func TestMilestoneProcessUpdatesTimestamp(t *testing.T) {
+	t.Parallel()
+
+	db := rawdb.NewMemoryDatabase()
+	s := NewTestServiceWithGracePeriod(db, milestoneGracePeriod)
+	milestone := s.milestoneService.(*milestone)
+
+	// Initially, lastProcessedAt should be zero
+	milestone.processingMu.RLock()
+	initialTime := milestone.lastProcessedAt
+	milestone.processingMu.RUnlock()
+	require.True(t, initialTime.IsZero(), "expected initial timestamp to be zero")
+
+	// Process a milestone
+	beforeProcess := time.Now()
+	s.ProcessMilestone(uint64(100), common.Hash{1})
+	afterProcess := time.Now()
+
+	// Check that timestamp was updated
+	milestone.processingMu.RLock()
+	updatedTime := milestone.lastProcessedAt
+	milestone.processingMu.RUnlock()
+
+	require.False(t, updatedTime.IsZero(), "expected timestamp to be updated")
+	require.True(t, updatedTime.After(beforeProcess) || updatedTime.Equal(beforeProcess), 
+		"expected timestamp to be after or equal to before process time")
+	require.True(t, updatedTime.Before(afterProcess) || updatedTime.Equal(afterProcess), 
+		"expected timestamp to be before or equal to after process time")
+}
+
+// TestMilestoneGracePeriodConstant tests that the grace period constant is properly set
+func TestMilestoneGracePeriodConstant(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t, milestoneGracePeriod, 30*time.Second, "expected grace period to be 30 seconds")
+}
+
+// TestMilestoneGracePeriodConcurrency tests grace period under concurrent access
+func TestMilestoneGracePeriodConcurrency(t *testing.T) {
+	t.Parallel()
+
+	db := rawdb.NewMemoryDatabase()
+	s := NewTestServiceWithGracePeriod(db, milestoneGracePeriod)
+	s.ProcessMilestone(uint64(100), common.Hash{1})
+	milestone := s.milestoneService.(*milestone)
+
+	// Mock fetchHeadersByNumber that returns mismatched hash
+	fetchHeadersByNumber := func(number uint64, _ int, _ int, _ bool) ([]*types.Header, []common.Hash, error) {
+		header := &types.Header{Number: big.NewInt(int64(number))}
+		wrongHash := common.Hash{2}
+		return []*types.Header{header}, []common.Hash{wrongHash}, nil
+	}
+
+	// Test concurrent access to IsValidPeer during grace period
+	var wg sync.WaitGroup
+	results := make([]bool, 10)
+	errors := make([]error, 10)
+
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			res, err := milestone.IsValidPeer(fetchHeadersByNumber)
+			results[index] = res
+			errors[index] = err
+		}(i)
+	}
+
+	wg.Wait()
+
+	// All should succeed during grace period
+	for i := 0; i < 10; i++ {
+		require.True(t, results[i], "expected validation to pass during grace period")
+		require.NoError(t, errors[i], "expected no error during grace period")
+	}
 }

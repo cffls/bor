@@ -1,6 +1,9 @@
 package whitelist
 
 import (
+	"sync"
+	"time"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/flags"
 	"github.com/ethereum/go-ethereum/core/rawdb"
@@ -20,6 +23,11 @@ type milestone struct {
 	FutureMilestoneList  map[uint64]common.Hash // Future Milestone list
 	FutureMilestoneOrder []uint64               // Future Milestone Order
 	MaxCapacity          int                    //Capacity of future Milestone list
+
+	// Milestone processing timestamp tracking for grace period
+	processingMu    sync.RWMutex
+	lastProcessedAt time.Time
+	gracePeriod     time.Duration
 }
 
 type milestoneService interface {
@@ -56,6 +64,22 @@ func (m *milestone) IsValidChain(currentHeader *types.Header, chain []*types.Hea
 	//Checking for the milestone flag
 	if !flags.Milestone {
 		return true, nil
+	}
+
+	// Check if we're within grace period of recent milestone processing
+	m.processingMu.RLock()
+	lastProcessed := m.lastProcessedAt
+	m.processingMu.RUnlock()
+
+	// Only apply grace period if we have actually processed a milestone (lastProcessedAt is not zero)
+	if !lastProcessed.IsZero() && m.gracePeriod > 0 {
+		timeSinceLastProcessing := time.Since(lastProcessed)
+		if timeSinceLastProcessing < m.gracePeriod {
+			log.Debug("Skipping milestone chain validation due to recent processing",
+				"timeSince", timeSinceLastProcessing, "gracePeriod", m.gracePeriod)
+			MilestoneChainMeter.Mark(int64(1))
+			return true, nil
+		}
 	}
 
 	m.finality.RLock()
@@ -100,6 +124,22 @@ func (m *milestone) IsValidPeer(fetchHeadersByNumber func(number uint64, amount 
 		return true, nil
 	}
 
+	// Check if we're within grace period of recent milestone processing
+	m.processingMu.RLock()
+	lastProcessed := m.lastProcessedAt
+	m.processingMu.RUnlock()
+
+	// Only apply grace period if we have actually processed a milestone (lastProcessedAt is not zero)
+	if !lastProcessed.IsZero() && m.gracePeriod > 0 {
+		timeSinceLastProcessing := time.Since(lastProcessed)
+		if timeSinceLastProcessing < m.gracePeriod {
+			log.Debug("Skipping milestone peer validation due to recent processing",
+				"timeSince", timeSinceLastProcessing, "gracePeriod", m.gracePeriod)
+			MilestonePeerMeter.Mark(int64(1))
+			return true, nil
+		}
+	}
+
 	res, err := m.finality.IsValidPeer(fetchHeadersByNumber)
 
 	if res {
@@ -114,6 +154,11 @@ func (m *milestone) IsValidPeer(fetchHeadersByNumber func(number uint64, amount 
 func (m *milestone) Process(block uint64, hash common.Hash) {
 	m.finality.Lock()
 	defer m.finality.Unlock()
+
+	// Record processing timestamp for grace period
+	m.processingMu.Lock()
+	m.lastProcessedAt = time.Now()
+	m.processingMu.Unlock()
 
 	m.finality.Process(block, hash)
 
