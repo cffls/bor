@@ -763,6 +763,8 @@ type ParallelEVMConfig struct {
 	SpeculativeProcesses int `hcl:"procs,optional" toml:"procs,optional"`
 
 	Enforce bool `hcl:"enforce,optional" toml:"enforce,optional"`
+
+	OpcodeLevel bool `hcl:"opcode-level,optional" toml:"opcode-level,optional"`
 }
 
 type WitnessConfig struct {
@@ -1656,6 +1658,7 @@ func (c *Config) buildEth(stack *node.Node, accountManager *accounts.Manager) (*
 	n.ParallelEVM.Enable = c.ParallelEVM.Enable
 	n.ParallelEVM.SpeculativeProcesses = c.ParallelEVM.SpeculativeProcesses
 	n.ParallelEVM.Enforce = c.ParallelEVM.Enforce
+	n.ParallelEVM.OpcodeLevel = c.ParallelEVM.OpcodeLevel
 
 	n.WitnessProtocol = c.Witness.Enable
 	if c.SyncMode == "stateless" {

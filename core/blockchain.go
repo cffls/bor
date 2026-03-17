@@ -415,6 +415,7 @@ type BlockChain struct {
 	parallelProcessor              Processor // Parallel block transaction processor interface
 	parallelSpeculativeProcesses   int       // Number of parallel speculative processes
 	enforceParallelProcessor       bool
+	opcodeLevel              bool      // Opcode-level BlockSTM: goroutine suspension on dependency
 	parallelStatelessImportEnabled atomic.Bool // Whether parallel stateless import is enabled via config
 	parallelStatelessImportWorkers int         // Number of workers to use for parallel stateless import
 	forker                         *ForkChoice
@@ -696,7 +697,7 @@ func (bc *BlockChain) IsParallelStatelessImportEnabled() bool {
 
 // NewParallelBlockChain is similar to NewBlockChain and creates a new blockchain object,
 // but with a parallel state processor
-func NewParallelBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine, cfg *BlockChainConfig, numprocs int, enforce bool) (*BlockChain, error) {
+func NewParallelBlockChain(db ethdb.Database, genesis *Genesis, engine consensus.Engine, cfg *BlockChainConfig, numprocs int, enforce bool, opcodeLevel ...bool) (*BlockChain, error) {
 	bc, err := NewBlockChain(db, genesis, engine, cfg)
 	if err != nil {
 		return nil, err
@@ -705,6 +706,10 @@ func NewParallelBlockChain(db ethdb.Database, genesis *Genesis, engine consensus
 	bc.parallelProcessor = NewParallelStateProcessor(bc.hc, bc)
 	bc.parallelSpeculativeProcesses = numprocs
 	bc.enforceParallelProcessor = enforce
+
+	if len(opcodeLevel) > 0 {
+		bc.opcodeLevel = opcodeLevel[0]
+	}
 
 	return bc, nil
 }

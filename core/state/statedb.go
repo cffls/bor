@@ -116,6 +116,12 @@ type StateDB struct {
 	revertedKeys map[blockstm.Key]struct{}
 	dep          int
 
+	// Goroutine suspension support (opcode-level BlockSTM).
+	// When opcodeLevel is true, MVRead blocks on a channel instead of panicking,
+	// allowing the goroutine to resume execution after the dependency completes.
+	// The shutdownCh and semaphore are obtained from the MVHashMap.
+	opcodeLevel bool
+
 	// DB error.
 	// State objects are used by the consensus core and VM which are
 	// unable to deal with database-level errors. Any error that occurs
@@ -329,6 +335,14 @@ func (s *StateDB) SetIncarnation(inc int) {
 	s.incarnation = inc
 }
 
+// SetOpcodeLevel enables goroutine suspension mode for opcode-level BlockSTM.
+// When enabled, MVRead blocks on a channel instead of panicking when a dependency
+// is detected, allowing the goroutine to resume after the dependency completes.
+// The shutdown channel and semaphore are read from the MVHashMap.
+func (s *StateDB) SetOpcodeLevel(enabled bool) {
+	s.opcodeLevel = enabled
+}
+
 type StorageVal[T any] struct {
 	Value *T
 }
@@ -389,8 +403,23 @@ func MVRead[T any](s *StateDB, k blockstm.Key, defaultV T, readStorage func(s *S
 		v = readStorage(res.Value().(*StateDB))
 		rd.Kind = blockstm.ReadKindMap
 	case blockstm.MVReadResultDependency:
-		s.dep = res.DepIdx()
-		panic("Found dependency")
+		if !s.opcodeLevel {
+			s.dep = res.DepIdx()
+			panic("Found dependency")
+		}
+
+		// Opcode-level BlockSTM: spawn replacement worker, wait, retry.
+		mvh := s.mvHashmap
+		waitCh := mvh.WaitForTx(res.DepIdx())
+		mvh.OnWorkerSuspend() // spawn replacement before blocking
+
+		select {
+		case <-waitCh:
+			return MVRead(s, k, defaultV, readStorage)
+		case <-mvh.ShutdownCh():
+			s.dep = res.DepIdx()
+			panic("Found dependency")
+		}
 	case blockstm.MVReadResultNone:
 		v = readStorage(s)
 		rd.Kind = blockstm.ReadKindStorage

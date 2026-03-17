@@ -1245,6 +1245,12 @@ func (c *Command) Flags(config *Config) *flagset.Flagset {
 		Value:   &c.cliConfig.ParallelEVM.Enforce,
 		Default: c.cliConfig.ParallelEVM.Enforce,
 	})
+	f.BoolFlag(&flagset.BoolFlag{
+		Name:    "parallelevm.opcode-level",
+		Usage:   "Enable opcode-level BlockSTM: suspend goroutine on dependency instead of re-executing",
+		Value:   &c.cliConfig.ParallelEVM.OpcodeLevel,
+		Default: c.cliConfig.ParallelEVM.OpcodeLevel,
+	})
 
 	// Witness Protocol Flags
 	f.BoolFlag(&flagset.BoolFlag{

@@ -40,6 +40,7 @@ type ParallelEVMConfig struct {
 	Enable               bool
 	SpeculativeProcesses int
 	Enforce              bool
+	OpcodeLevel    bool // Enable opcode-level BlockSTM (goroutine suspension on dependency)
 }
 
 // StateProcessor is a basic Processor, which takes care of transitioning
@@ -87,10 +88,11 @@ type ExecutionTask struct {
 	// first 2 element in dependencies -> transaction index, and flag representing if delay is allowed or not
 	//                                       (0 -> delay is not allowed, 1 -> delay is allowed)
 	// next k elements in dependencies -> transaction indexes on which transaction i is dependent on
-	dependencies []int
-	coinbase     common.Address
-	blockContext vm.BlockContext
-	jumpDests    vm.JumpDestCache
+	dependencies      []int
+	coinbase          common.Address
+	blockContext      vm.BlockContext
+	jumpDests         vm.JumpDestCache
+	opcodeLevel bool // enable goroutine suspension in MVRead
 }
 
 func (task *ExecutionTask) Execute(mvh *blockstm.MVHashMap, incarnation int) (err error) {
@@ -98,6 +100,7 @@ func (task *ExecutionTask) Execute(mvh *blockstm.MVHashMap, incarnation int) (er
 	task.statedb.SetTxContext(task.tx.Hash(), task.index)
 	task.statedb.SetMVHashmap(mvh)
 	task.statedb.SetIncarnation(incarnation)
+	task.statedb.SetOpcodeLevel(task.opcodeLevel)
 
 	evm := vm.NewEVM(task.blockContext, task.statedb, task.config, task.evmConfig)
 
@@ -318,17 +321,25 @@ func (p *ParallelStateProcessor) Process(block *types.Block, statedb *state.Stat
 
 	shouldDelayFeeCal := true
 
-	blockTxDependency := block.GetTxDependency()
+	// Suspend mode handles all dependencies via goroutine suspension in MVRead,
+	// so block header dependency metadata is not needed.
+	var deps map[int][]int
 
-	deps := GetDeps(blockTxDependency)
+	if !p.bc.opcodeLevel {
+		blockTxDependency := block.GetTxDependency()
 
-	if !VerifyDeps(deps) || len(blockTxDependency) != len(block.Transactions()) {
-		blockTxDependency = nil
+		deps = GetDeps(blockTxDependency)
+
+		if !VerifyDeps(deps) || len(blockTxDependency) != len(block.Transactions()) {
+			blockTxDependency = nil
+			deps = make(map[int][]int)
+		}
+
+		if blockTxDependency != nil {
+			metadata = true
+		}
+	} else {
 		deps = make(map[int][]int)
-	}
-
-	if blockTxDependency != nil {
-		metadata = true
 	}
 
 	blockContext := NewEVMBlockContext(header, p.bc, author)
@@ -417,6 +428,7 @@ func (p *ParallelStateProcessor) Process(block *types.Block, statedb *state.Stat
 			coinbase:          coinbase,
 			blockContext:      blockContext,
 			jumpDests:         sharedJumpDests,
+			opcodeLevel: p.bc.opcodeLevel,
 		}
 
 		tasks = append(tasks, task)
@@ -425,7 +437,14 @@ func (p *ParallelStateProcessor) Process(block *types.Block, statedb *state.Stat
 	backupStateDB := statedb.Copy()
 
 	profile := false
-	result, err := blockstm.ExecuteParallel(tasks, profile, metadata, p.bc.parallelSpeculativeProcesses, interruptCtx)
+
+	var result blockstm.ParallelExecutionResult
+
+	if p.bc.opcodeLevel {
+		result, err = blockstm.ExecuteParallelOpcodeLevel(tasks, profile, p.bc.parallelSpeculativeProcesses, interruptCtx)
+	} else {
+		result, err = blockstm.ExecuteParallel(tasks, profile, metadata, p.bc.parallelSpeculativeProcesses, interruptCtx)
+	}
 
 	if err == nil && profile && result.Deps != nil {
 		_, weight := result.Deps.LongestPath(*result.Stats)
@@ -459,7 +478,11 @@ func (p *ParallelStateProcessor) Process(block *types.Block, statedb *state.Stat
 				t.totalUsedGas = usedGas
 			}
 
-			_, err = blockstm.ExecuteParallel(tasks, false, metadata, p.bc.parallelSpeculativeProcesses, interruptCtx)
+			if p.bc.opcodeLevel {
+				_, err = blockstm.ExecuteParallelOpcodeLevel(tasks, false, p.bc.parallelSpeculativeProcesses, interruptCtx)
+			} else {
+				_, err = blockstm.ExecuteParallel(tasks, false, metadata, p.bc.parallelSpeculativeProcesses, interruptCtx)
+			}
 
 			break
 		}

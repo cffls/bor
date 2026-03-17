@@ -147,15 +147,96 @@ type mapShard struct {
 type MVHashMap struct {
 	shards [numShards]mapShard
 	bloom  writeBloom
+
+	// Completion signaling for opcode-level BlockSTM goroutine suspension.
+	completionChans sync.Map // int → chan struct{}
+	shutdownCh      chan struct{}
+
+	// Called when a worker is about to block in MVRead, so a replacement
+	// can be spawned to prevent worker pool exhaustion.
+	onWorkerSuspend func()
 }
 
 func MakeMVHashMap() *MVHashMap {
-	mv := &MVHashMap{}
+	mv := &MVHashMap{
+		shutdownCh: make(chan struct{}),
+	}
 	for i := range mv.shards {
 		mv.shards[i].m = make(map[Key]*TxnIndexCells)
 	}
 
 	return mv
+}
+
+// WaitForTx returns a channel that is closed when tx txIdx completes.
+func (mv *MVHashMap) WaitForTx(txIdx int) <-chan struct{} {
+	ch := make(chan struct{})
+	actual, _ := mv.completionChans.LoadOrStore(txIdx, ch)
+
+	return actual.(chan struct{})
+}
+
+// NotifyCompletion unblocks all goroutines waiting for tx txIdx and ensures
+// future WaitForTx calls return immediately (pre-closed channel in the map).
+func (mv *MVHashMap) NotifyCompletion(txIdx int) {
+	// Create a pre-closed channel. If no entry exists yet, this is stored so
+	// future WaitForTx calls find it and unblock immediately.
+	closedCh := make(chan struct{})
+	close(closedCh)
+
+	actual, loaded := mv.completionChans.LoadOrStore(txIdx, closedCh)
+	if loaded {
+		// Entry already existed (from a prior WaitForTx or ResetCompletion).
+		// Close it if not already closed.
+		ch := actual.(chan struct{})
+
+		select {
+		case <-ch:
+			// Already closed — also store our pre-closed channel to ensure
+			// the map entry is definitely closed (ResetCompletion may have
+			// replaced a closed channel with an open one that was then closed,
+			// but Swap ensures the latest state is closed).
+		default:
+			close(ch)
+		}
+	}
+	// If !loaded, the pre-closed channel was stored. Future WaitForTx calls
+	// will find it via LoadOrStore and unblock immediately.
+}
+
+// ResetCompletion creates a fresh channel for txIdx so that future waiters
+// block until the new incarnation completes.
+func (mv *MVHashMap) ResetCompletion(txIdx int) {
+	mv.completionChans.Store(txIdx, make(chan struct{}))
+}
+
+// Shutdown closes the shutdown channel, unblocking all goroutines waiting
+// in MVRead so they can fall back to the panic-based abort path.
+func (mv *MVHashMap) Shutdown() {
+	select {
+	case <-mv.shutdownCh:
+		// already closed
+	default:
+		close(mv.shutdownCh)
+	}
+}
+
+// ShutdownCh returns the shutdown channel for passing to StateDB.
+func (mv *MVHashMap) ShutdownCh() <-chan struct{} {
+	return mv.shutdownCh
+}
+
+// SetOnWorkerSuspend sets the callback invoked when a worker is about to
+// block in MVRead, so a replacement worker can be spawned.
+func (mv *MVHashMap) SetOnWorkerSuspend(fn func()) {
+	mv.onWorkerSuspend = fn
+}
+
+// OnWorkerSuspend calls the suspension callback if set.
+func (mv *MVHashMap) OnWorkerSuspend() {
+	if mv.onWorkerSuspend != nil {
+		mv.onWorkerSuspend()
+	}
 }
 
 func (mv *MVHashMap) getShard(k Key) *mapShard {
