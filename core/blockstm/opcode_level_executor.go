@@ -69,6 +69,10 @@ type OpcodeLevelExecutor struct {
 	cntSuspensions     atomic.Int64 // times a worker blocked in MVRead waiting for dependency
 	cntReplacements    atomic.Int64 // replacement workers spawned during suspensions
 
+	// Conflict predictions: txIndex → list of predicted conflict addresses.
+	// Pre-populated as FlagEstimate in MVHashMap before workers start.
+	predictions map[int][]common.Address
+
 	begin   time.Time
 	profile bool
 }
@@ -138,6 +142,18 @@ func (pe *OpcodeLevelExecutor) Prepare() error {
 			}
 
 			prevSenderTx[t.Sender()] = i
+		}
+	}
+
+	// Pre-populate MVHashMap with FlagEstimate for predicted conflict addresses.
+	// This makes MVRead detect the dependency on first execution and suspend
+	// instead of reading stale data from storage.
+	if pe.predictions != nil {
+		for txIdx, addrs := range pe.predictions {
+			for _, addr := range addrs {
+				pe.mvh.WriteEstimate(NewAddressKey(addr), Version{txIdx, 0})
+				pe.mvh.WriteEstimate(NewSubpathKey(addr, SubpathBalance), Version{txIdx, 0})
+			}
 		}
 	}
 
@@ -421,7 +437,7 @@ func (pe *OpcodeLevelExecutor) Step(res *ExecResult) (result ParallelExecutionRe
 			deps = BuildDAG(*pe.lastTxIO)
 		}
 
-		return ParallelExecutionResult{pe.lastTxIO, &pe.stats, &deps, allDeps}, err
+		return ParallelExecutionResult{TxIO: pe.lastTxIO, Stats: &pe.stats, Deps: &deps, AllDeps: allDeps, Aborts: pe.cntAbort, Suspensions: pe.cntSuspensions.Load()}, err
 	}
 
 	// Dispatch next guaranteed task
@@ -492,12 +508,13 @@ func (pe *OpcodeLevelExecutor) SpawnReplacementWorker() {
 
 type PropertyCheckOL func(*OpcodeLevelExecutor) error
 
-func executeOpcodeLevelWithCheck(tasks []ExecTask, profile bool, numProcs int, interruptCtx context.Context) (result ParallelExecutionResult, err error) {
+func executeOpcodeLevelWithCheck(tasks []ExecTask, profile bool, numProcs int, predictions map[int][]common.Address, interruptCtx context.Context) (result ParallelExecutionResult, err error) {
 	if len(tasks) == 0 {
-		return ParallelExecutionResult{MakeTxnInputOutput(len(tasks)), nil, nil, nil}, nil
+		return ParallelExecutionResult{TxIO: MakeTxnInputOutput(len(tasks))}, nil
 	}
 
 	pe := NewOpcodeLevelExecutor(tasks, profile, numProcs)
+	pe.predictions = predictions
 	err = pe.Prepare()
 
 	if err != nil {
@@ -527,6 +544,6 @@ func executeOpcodeLevelWithCheck(tasks []ExecTask, profile bool, numProcs int, i
 	return
 }
 
-func ExecuteParallelOpcodeLevel(tasks []ExecTask, profile bool, numProcs int, interruptCtx context.Context) (result ParallelExecutionResult, err error) {
-	return executeOpcodeLevelWithCheck(tasks, profile, numProcs, interruptCtx)
+func ExecuteParallelOpcodeLevel(tasks []ExecTask, profile bool, numProcs int, predictions map[int][]common.Address, interruptCtx context.Context) (result ParallelExecutionResult, err error) {
+	return executeOpcodeLevelWithCheck(tasks, profile, numProcs, predictions, interruptCtx)
 }

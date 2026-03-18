@@ -191,7 +191,7 @@ func TestLateConflictComparison(t *testing.T) {
 				// Run opcode-level (block + resume)
 				olTasks := makeLateConflictTasks(numTx, workDuration, true)
 				olStart := time.Now()
-				olResult, err := ExecuteParallelOpcodeLevel(olTasks, false, numProcs, nil)
+				olResult, err := ExecuteParallelOpcodeLevel(olTasks, false, numProcs, nil, nil)
 				olDuration := time.Since(olStart)
 				if err != nil {
 					t.Fatalf("opcode-level error: %v", err)
@@ -235,7 +235,7 @@ func BenchmarkLateConflict(b *testing.B) {
 	b.Run("OpcodeLevel", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
 			tasks := makeLateConflictTasks(numTx, workDuration, true)
-			_, err := ExecuteParallelOpcodeLevel(tasks, false, numProcs, nil)
+			_, err := ExecuteParallelOpcodeLevel(tasks, false, numProcs, nil, nil)
 			if err != nil {
 				b.Fatal(err)
 			}

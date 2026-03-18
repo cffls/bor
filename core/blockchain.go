@@ -38,6 +38,7 @@ import (
 	"github.com/ethereum/go-ethereum/common/mclock"
 	"github.com/ethereum/go-ethereum/common/prque"
 	"github.com/ethereum/go-ethereum/consensus"
+	"github.com/ethereum/go-ethereum/core/blockstm"
 	"github.com/ethereum/go-ethereum/consensus/misc/eip4844"
 	"github.com/ethereum/go-ethereum/core/history"
 	"github.com/ethereum/go-ethereum/core/rawdb"
@@ -416,6 +417,7 @@ type BlockChain struct {
 	parallelSpeculativeProcesses   int       // Number of parallel speculative processes
 	enforceParallelProcessor       bool
 	opcodeLevel              bool      // Opcode-level BlockSTM: goroutine suspension on dependency
+	conflictPredictor        *blockstm.ConflictPredictor // Learns (msg.To → conflict addr) for prediction
 	parallelStatelessImportEnabled atomic.Bool // Whether parallel stateless import is enabled via config
 	parallelStatelessImportWorkers int         // Number of workers to use for parallel stateless import
 	forker                         *ForkChoice
@@ -709,6 +711,10 @@ func NewParallelBlockChain(db ethdb.Database, genesis *Genesis, engine consensus
 
 	if len(opcodeLevel) > 0 {
 		bc.opcodeLevel = opcodeLevel[0]
+
+		if bc.opcodeLevel {
+			bc.conflictPredictor = blockstm.NewConflictPredictor()
+		}
 	}
 
 	return bc, nil

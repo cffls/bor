@@ -75,6 +75,10 @@ const addressType = 1
 const stateType = 2
 const subpathType = 3
 
+// Subpath identifiers — must match core/state constants (BalancePath, NoncePath, etc.)
+const SubpathBalance byte = 1
+const SubpathNonce byte = 2
+
 const KeyLength = common.AddressLength + common.HashLength + 2
 
 type Key [KeyLength]byte
@@ -343,6 +347,43 @@ func (mv *MVHashMap) Write(k Key, v Version, data interface{}) {
 		ci.incarnation = v.Incarnation
 		ci.data = data
 	}
+	cells.rw.Unlock()
+}
+
+// WriteEstimate inserts a FlagEstimate entry for a key at the given version.
+// Used by conflict prediction to pre-populate the MVHashMap so that MVRead
+// detects a dependency and suspends (or aborts) on the first execution, instead
+// of reading a stale value from storage.
+func (mv *MVHashMap) WriteEstimate(k Key, v Version) {
+	mv.bloom.add(k)
+
+	cells := mv.getKeyCells(k, func(kenc Key) (cells *TxnIndexCells) {
+		shard := mv.getShard(kenc)
+		shard.mu.Lock()
+		cells, ok := shard.m[kenc]
+		if !ok {
+			cells = &TxnIndexCells{}
+			shard.m[kenc] = cells
+		}
+		shard.mu.Unlock()
+
+		return
+	})
+
+	cells.rw.Lock()
+	if pos, found := cells.find(v.TxnIndex); !found {
+		cells.entries = append(cells.entries, txnEntry{})
+		copy(cells.entries[pos+1:], cells.entries[pos:])
+		cells.entries[pos] = txnEntry{
+			index: v.TxnIndex,
+			cell: &WriteCell{
+				flag:        FlagEstimate,
+				incarnation: v.Incarnation,
+				data:        nil,
+			},
+		}
+	}
+	// If entry already exists, don't overwrite — real Write/FlushMVWriteSet takes precedence.
 	cells.rw.Unlock()
 }
 

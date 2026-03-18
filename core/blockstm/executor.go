@@ -181,6 +181,10 @@ type ParallelExecutionResult struct {
 	Stats   *map[int]ExecutionStat
 	Deps    *DAG
 	AllDeps map[int]map[int]bool
+
+	// Opcode-level metrics (only populated by OpcodeLevelExecutor)
+	Aborts      int
+	Suspensions int64
 }
 
 const numGoProcs = 1
@@ -586,7 +590,7 @@ func (pe *ParallelExecutor) Step(res *ExecResult) (result ParallelExecutionResul
 			deps = BuildDAG(*pe.lastTxIO)
 		}
 
-		return ParallelExecutionResult{pe.lastTxIO, &pe.stats, &deps, allDeps}, err
+		return ParallelExecutionResult{TxIO: pe.lastTxIO, Stats: &pe.stats, Deps: &deps, AllDeps: allDeps}, err
 	}
 
 	// Send the next immediate pending transaction to be executed
@@ -622,7 +626,7 @@ type PropertyCheck func(*ParallelExecutor) error
 
 func executeParallelWithCheck(tasks []ExecTask, profile bool, check PropertyCheck, metadata bool, numProcs int, interruptCtx context.Context) (result ParallelExecutionResult, err error) {
 	if len(tasks) == 0 {
-		return ParallelExecutionResult{MakeTxnInputOutput(len(tasks)), nil, nil, nil}, nil
+		return ParallelExecutionResult{TxIO: MakeTxnInputOutput(len(tasks))}, nil
 	}
 
 	pe := NewParallelExecutor(tasks, profile, metadata, numProcs)

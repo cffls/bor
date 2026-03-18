@@ -135,7 +135,7 @@ func runOpcodeLevel(t *testing.T, tasks []ExecTask) time.Duration {
 	t.Helper()
 
 	start := time.Now()
-	result, err := ExecuteParallelOpcodeLevel(tasks, false, numProcs, nil)
+	result, err := ExecuteParallelOpcodeLevel(tasks, false, numProcs, nil, nil)
 
 	assert.NoError(t, err, "error during suspend execution")
 	assert.NotNil(t, result.TxIO)
@@ -254,7 +254,7 @@ func TestOpcodeLevelExecutorHighConflict(t *testing.T) {
 func TestOpcodeLevelExecutorZeroTx(t *testing.T) {
 	t.Parallel()
 
-	result, err := ExecuteParallelOpcodeLevel([]ExecTask{}, false, numProcs, nil)
+	result, err := ExecuteParallelOpcodeLevel([]ExecTask{}, false, numProcs, nil, nil)
 	require.NoError(t, err)
 	assert.NotNil(t, result.TxIO)
 }
@@ -275,7 +275,7 @@ func TestOpcodeLevelExecutorContextCancel(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
-	_, err := ExecuteParallelOpcodeLevel(tasks, false, numProcs, ctx)
+	_, err := ExecuteParallelOpcodeLevel(tasks, false, numProcs, nil, ctx)
 
 	// Should either complete or return context error
 	if err != nil {

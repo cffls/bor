@@ -441,9 +441,49 @@ func (p *ParallelStateProcessor) Process(block *types.Block, statedb *state.Stat
 	var result blockstm.ParallelExecutionResult
 
 	if p.bc.opcodeLevel {
-		result, err = blockstm.ExecuteParallelOpcodeLevel(tasks, profile, p.bc.parallelSpeculativeProcesses, interruptCtx)
+		// Build predictions from conflict predictor
+		var predictions map[int][]common.Address
+
+		if p.bc.conflictPredictor != nil {
+			predictions = make(map[int][]common.Address)
+
+			for i, task := range tasks {
+				task := task.(*ExecutionTask)
+				if task.msg.To != nil {
+					if addrs := p.bc.conflictPredictor.Predict(*task.msg.To); len(addrs) > 0 {
+						predictions[i] = addrs
+					}
+				}
+			}
+		}
+
+		result, err = blockstm.ExecuteParallelOpcodeLevel(tasks, profile, p.bc.parallelSpeculativeProcesses, predictions, interruptCtx)
 	} else {
 		result, err = blockstm.ExecuteParallel(tasks, profile, metadata, p.bc.parallelSpeculativeProcesses, interruptCtx)
+	}
+
+	// Feed conflict predictor with data from this block's execution.
+	// Extract (msg.To → conflict_address) pairs from read/write set overlaps.
+	if err == nil && p.bc.conflictPredictor != nil && result.TxIO != nil {
+		for i := 1; i < len(tasks); i++ {
+			for _, rd := range result.TxIO.ReadSet(i) {
+				if rd.Kind == blockstm.ReadKindMap && rd.V.TxnIndex >= 0 {
+					conflictAddr := rd.Path.GetAddress()
+					readerTask := tasks[i].(*ExecutionTask)
+					writerTask := tasks[rd.V.TxnIndex].(*ExecutionTask)
+
+					if readerTask.msg.To != nil {
+						p.bc.conflictPredictor.Record(*readerTask.msg.To, conflictAddr)
+					}
+
+					if writerTask.msg.To != nil {
+						p.bc.conflictPredictor.Record(*writerTask.msg.To, conflictAddr)
+					}
+				}
+			}
+		}
+
+		p.bc.conflictPredictor.EndBlock()
 	}
 
 	if err == nil && profile && result.Deps != nil {
@@ -479,7 +519,7 @@ func (p *ParallelStateProcessor) Process(block *types.Block, statedb *state.Stat
 			}
 
 			if p.bc.opcodeLevel {
-				_, err = blockstm.ExecuteParallelOpcodeLevel(tasks, false, p.bc.parallelSpeculativeProcesses, interruptCtx)
+				_, err = blockstm.ExecuteParallelOpcodeLevel(tasks, false, p.bc.parallelSpeculativeProcesses, nil, interruptCtx)
 			} else {
 				_, err = blockstm.ExecuteParallel(tasks, false, metadata, p.bc.parallelSpeculativeProcesses, interruptCtx)
 			}
