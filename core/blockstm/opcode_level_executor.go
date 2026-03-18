@@ -219,7 +219,13 @@ func (pe *OpcodeLevelExecutor) worker(procNum int) {
 
 	if procNum < pe.numSpeculativeProcs {
 		for range pe.chSpeculativeTasks {
-			doWork(pe.specTaskQueue.Pop().(ExecVersionView))
+			// Use TryPop: a replacement worker may have stolen the task.
+			taskVal := pe.specTaskQueue.(*SafePriorityQueue).TryPop()
+			if taskVal == nil {
+				continue
+			}
+
+			doWork(taskVal.(ExecVersionView))
 		}
 	} else {
 		for task := range pe.chTasks {
@@ -236,11 +242,27 @@ func (pe *OpcodeLevelExecutor) Close(wait bool) {
 	close(pe.chSettle)
 
 	if wait {
-		pe.workerWg.Wait()
+		// Drain chResults so workers unblocked by Shutdown() can send
+		// their results without blocking (preventing workerWg deadlock).
+		done := make(chan struct{})
 
-		settleWaitStart := time.Now()
-		pe.settleWg.Wait()
-		opcodeLevelSettleWaitTimer.UpdateSince(settleWaitStart)
+		go func() {
+			pe.workerWg.Wait()
+			close(done)
+		}()
+
+		for {
+			select {
+			case <-done:
+				settleWaitStart := time.Now()
+				pe.settleWg.Wait()
+				opcodeLevelSettleWaitTimer.UpdateSince(settleWaitStart)
+
+				return
+			case <-pe.chResults:
+				// Drain — discard results from workers finishing after shutdown
+			}
+		}
 	}
 }
 
@@ -439,7 +461,15 @@ func (pe *OpcodeLevelExecutor) SpawnReplacementWorker() {
 		// Try to pick up a speculative task. If none available, exit.
 		select {
 		case <-pe.chSpeculativeTasks:
-			task := pe.specTaskQueue.Pop().(ExecVersionView)
+			// Use TryPop: another worker may have consumed the task
+			// between the channel signal and this Pop.
+			taskVal := pe.specTaskQueue.(*SafePriorityQueue).TryPop()
+			if taskVal == nil {
+				// Another worker already consumed the task — nothing to do.
+				return
+			}
+
+			task := taskVal.(ExecVersionView)
 
 			pe.activeWorkers.Add(1)
 
@@ -454,9 +484,6 @@ func (pe *OpcodeLevelExecutor) SpawnReplacementWorker() {
 			pe.chResults <- struct{}{}
 
 			pe.activeWorkers.Add(-1)
-		case <-pe.chTasks:
-			// Also handle guaranteed tasks
-			return
 		default:
 			// No work available
 		}

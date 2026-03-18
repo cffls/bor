@@ -162,6 +162,20 @@ func (pq *SafePriorityQueue) Len() int {
 	return pq.queue.Len()
 }
 
+// TryPop atomically checks if the queue is non-empty and pops. Returns nil if empty.
+func (pq *SafePriorityQueue) TryPop() interface{} {
+	pq.m.Lock()
+	defer pq.m.Unlock()
+
+	if pq.queue.Len() == 0 {
+		return nil
+	}
+
+	v := heap.Pop(pq.queue).(int)
+
+	return pq.data[v]
+}
+
 type ParallelExecutionResult struct {
 	TxIO    *TxnInputOutput
 	Stats   *map[int]ExecutionStat
