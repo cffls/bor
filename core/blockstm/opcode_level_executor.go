@@ -73,6 +73,11 @@ type OpcodeLevelExecutor struct {
 	// Pre-populated as FlagEstimate in MVHashMap before workers start.
 	predictions map[int][]common.Address
 
+	// Pre-written estimate keys per tx, for cleanup after execution.
+	// If a tx didn't actually write a pre-written key, it must be deleted
+	// to prevent infinite dependency loops.
+	preWrittenKeys map[int][]Key
+
 	begin   time.Time
 	profile bool
 }
@@ -146,13 +151,19 @@ func (pe *OpcodeLevelExecutor) Prepare() error {
 	}
 
 	// Pre-populate MVHashMap with FlagEstimate for predicted conflict addresses.
-	// This makes MVRead detect the dependency on first execution and suspend
-	// instead of reading stale data from storage.
+	// Track which keys were pre-written so we can clean up after execution.
 	if pe.predictions != nil {
+		pe.preWrittenKeys = make(map[int][]Key)
+
 		for txIdx, addrs := range pe.predictions {
-			for _, addr := range addrs {
-				pe.mvh.WriteEstimate(NewAddressKey(addr), Version{txIdx, 0})
-				pe.mvh.WriteEstimate(NewSubpathKey(addr, SubpathBalance), Version{txIdx, 0})
+			for _, a := range addrs {
+				addrKey := NewAddressKey(a)
+				balKey := NewSubpathKey(a, SubpathBalance)
+
+				pe.mvh.WriteEstimate(addrKey, Version{txIdx, 0})
+				pe.mvh.WriteEstimate(balKey, Version{txIdx, 0})
+
+				pe.preWrittenKeys[txIdx] = append(pe.preWrittenKeys[txIdx], addrKey, balKey)
 			}
 		}
 	}
@@ -206,12 +217,32 @@ func (pe *OpcodeLevelExecutor) worker(procNum int) {
 
 		res := task.Execute()
 
+		txIdx := res.ver.TxnIndex
+
 		if res.err == nil {
 			pe.mvh.FlushMVWriteSet(res.txAllOut)
 		}
 
+		// Clean up pre-written estimate keys that the tx did NOT actually write.
+		// Without this, stale FlagEstimate entries cause infinite dependency loops:
+		// a reader finds the estimate, waits, resumes, re-reads the same estimate.
+		if preKeys, ok := pe.preWrittenKeys[txIdx]; ok {
+			// Build set of keys the tx actually wrote
+			actualWrites := make(map[Key]struct{}, len(res.txAllOut))
+			for _, w := range res.txAllOut {
+				actualWrites[w.Path] = struct{}{}
+			}
+
+			// Delete pre-written keys that weren't actually written
+			for _, pk := range preKeys {
+				if _, wrote := actualWrites[pk]; !wrote {
+					pe.mvh.Delete(pk, txIdx)
+				}
+			}
+		}
+
 		// Notify completion so goroutines suspended in MVRead can resume
-		pe.mvh.NotifyCompletion(res.ver.TxnIndex)
+		pe.mvh.NotifyCompletion(txIdx)
 
 		pe.resultQueue.Push(res.ver.TxnIndex, res)
 		pe.chResults <- struct{}{}
@@ -491,12 +522,28 @@ func (pe *OpcodeLevelExecutor) SpawnReplacementWorker() {
 
 			res := task.Execute()
 
+			txIdx := res.ver.TxnIndex
+
 			if res.err == nil {
 				pe.mvh.FlushMVWriteSet(res.txAllOut)
 			}
 
-			pe.mvh.NotifyCompletion(res.ver.TxnIndex)
-			pe.resultQueue.Push(res.ver.TxnIndex, res)
+			// Clean up stale pre-written estimates (same as doWork)
+			if preKeys, ok := pe.preWrittenKeys[txIdx]; ok {
+				actualWrites := make(map[Key]struct{}, len(res.txAllOut))
+				for _, w := range res.txAllOut {
+					actualWrites[w.Path] = struct{}{}
+				}
+
+				for _, pk := range preKeys {
+					if _, wrote := actualWrites[pk]; !wrote {
+						pe.mvh.Delete(pk, txIdx)
+					}
+				}
+			}
+
+			pe.mvh.NotifyCompletion(txIdx)
+			pe.resultQueue.Push(txIdx, res)
 			pe.chResults <- struct{}{}
 
 			pe.activeWorkers.Add(-1)

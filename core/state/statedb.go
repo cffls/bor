@@ -387,49 +387,57 @@ func MVRead[T any](s *StateDB, k blockstm.Key, defaultV T, readStorage func(s *S
 	}
 
 	// Slow path: key might have been written by another tx.
-	res := s.mvHashmap.Read(k, s.txIndex)
-
+	// Uses a loop instead of recursion to avoid stack overflow under
+	// sustained contention.
 	var rd blockstm.ReadDescriptor
-
-	rd.V = blockstm.Version{
-		TxnIndex:    res.DepIdx(),
-		Incarnation: res.Incarnation(),
-	}
 
 	rd.Path = k
 
-	switch res.Status() {
-	case blockstm.MVReadResultDone:
-		v = readStorage(res.Value().(*StateDB))
-		rd.Kind = blockstm.ReadKindMap
-	case blockstm.MVReadResultDependency:
-		if !s.opcodeLevel {
-			s.dep = res.DepIdx()
-			panic("Found dependency")
+	for {
+		res := s.mvHashmap.Read(k, s.txIndex)
+
+		rd.V = blockstm.Version{
+			TxnIndex:    res.DepIdx(),
+			Incarnation: res.Incarnation(),
 		}
 
-		// Opcode-level BlockSTM: spawn replacement worker, wait, retry.
-		mvh := s.mvHashmap
-		waitCh := mvh.WaitForTx(res.DepIdx())
-		mvh.OnWorkerSuspend() // spawn replacement before blocking
+		switch res.Status() {
+		case blockstm.MVReadResultDone:
+			v = readStorage(res.Value().(*StateDB))
+			rd.Kind = blockstm.ReadKindMap
 
-		select {
-		case <-waitCh:
-			return MVRead(s, k, defaultV, readStorage)
-		case <-mvh.ShutdownCh():
-			s.dep = res.DepIdx()
-			panic("Found dependency")
+			s.readList = append(s.readList, rd)
+
+			return
+		case blockstm.MVReadResultDependency:
+			if !s.opcodeLevel {
+				s.dep = res.DepIdx()
+				panic("Found dependency")
+			}
+
+			// Opcode-level BlockSTM: spawn replacement worker, wait, retry.
+			mvh := s.mvHashmap
+			waitCh := mvh.WaitForTx(res.DepIdx())
+			mvh.OnWorkerSuspend()
+
+			select {
+			case <-waitCh:
+				continue // retry the read
+			case <-mvh.ShutdownCh():
+				s.dep = res.DepIdx()
+				panic("Found dependency")
+			}
+		case blockstm.MVReadResultNone:
+			v = readStorage(s)
+			rd.Kind = blockstm.ReadKindStorage
+
+			s.readList = append(s.readList, rd)
+
+			return
+		default:
+			return defaultV
 		}
-	case blockstm.MVReadResultNone:
-		v = readStorage(s)
-		rd.Kind = blockstm.ReadKindStorage
-	default:
-		return defaultV
 	}
-
-	s.readList = append(s.readList, rd)
-
-	return
 }
 
 func MVWrite(s *StateDB, k blockstm.Key) {
