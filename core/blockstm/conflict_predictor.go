@@ -61,7 +61,7 @@ func (p *ConflictPredictor) Record(msgTo common.Address, conflictKey Key) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	p.predCache = nil // invalidate cache
+	delete(p.predCache, msgTo) // targeted invalidation
 
 	if p.mappings[msgTo] == nil {
 		p.mappings[msgTo] = make(map[Key]uint32)

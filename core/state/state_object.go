@@ -55,8 +55,9 @@ type stateObject struct {
 	data     types.StateAccount  // Account data with all mutations applied in the scope of block
 
 	// Write caches.
-	trie Trie   // storage trie, which becomes non-nil on first access
-	code []byte // contract bytecode, which gets set when code is loaded
+	trie     Trie      // storage trie, which becomes non-nil on first access
+	code     []byte    // contract bytecode, which gets set when code is loaded
+	codeOnce sync.Once // ensures Code() is thread-safe for lazy loading
 
 	storageMutex   sync.Mutex
 	originStorage  Storage // Storage entries that have been accessed within the current block
@@ -535,26 +536,33 @@ func (s *stateObject) Address() common.Address {
 }
 
 // Code returns the contract code associated with this object, if any.
+// Thread-safe: uses sync.Once for lazy loading since MVRead can call this
+// from multiple goroutines on the same stateObject.
 func (s *stateObject) Code() []byte {
-	if len(s.code) != 0 {
-		return s.code
-	}
-
 	if bytes.Equal(s.CodeHash(), types.EmptyCodeHash.Bytes()) {
 		return nil
 	}
-	code, err := s.db.reader.Code(s.address, common.BytesToHash(s.CodeHash()))
-	if err != nil {
-		log.Error("Failed to load code", "address", s.address, "hash", fmt.Sprintf("%x", s.CodeHash()), "err", err)
-		s.db.setError(fmt.Errorf("can't load code hash %x: %v", s.CodeHash(), err))
-	}
-	if len(code) == 0 {
-		log.Error("Code is not found", "address", s.address, "hash", fmt.Sprintf("%x", s.CodeHash()))
-		s.db.setError(fmt.Errorf("code is not found %x", s.CodeHash()))
-	}
-	s.code = code
 
-	return code
+	s.codeOnce.Do(func() {
+		if len(s.code) != 0 {
+			return
+		}
+
+		code, err := s.db.reader.Code(s.address, common.BytesToHash(s.CodeHash()))
+		if err != nil {
+			log.Error("Failed to load code", "address", s.address, "hash", fmt.Sprintf("%x", s.CodeHash()), "err", err)
+			s.db.setError(fmt.Errorf("can't load code hash %x: %v", s.CodeHash(), err))
+		}
+
+		if len(code) == 0 {
+			log.Error("Code is not found", "address", s.address, "hash", fmt.Sprintf("%x", s.CodeHash()))
+			s.db.setError(fmt.Errorf("code is not found %x", s.CodeHash()))
+		}
+
+		s.code = code
+	})
+
+	return s.code
 }
 
 // CodeSize returns the size of the contract code associated with this object,

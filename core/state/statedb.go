@@ -114,7 +114,7 @@ type StateDB struct {
 	writeIndex   map[uint64]uint32            // cheap hash of Key → index in writeList
 	writeAddrs       map[common.Address]struct{}  // fast filter: addresses touched by writes
 	revertedKeys     map[blockstm.Key]struct{}
-	mvCopiedObjects  map[common.Address]struct{} // tracks deep-copied objects without ADDR key write
+	mvStorageCopied  map[common.Address]struct{} // tracks deep-copied objects from storage-only ops (no ADDR write)
 	dep          int
 
 	// Goroutine suspension support (opcode-level BlockSTM).
@@ -1260,8 +1260,8 @@ func (s *StateDB) mvRecordWritten(object *stateObject) *stateObject {
 	}
 
 	// Check if already deep-copied by a storage-only operation
-	if s.mvCopiedObjects != nil {
-		if _, copied := s.mvCopiedObjects[object.Address()]; copied {
+	if s.mvStorageCopied != nil {
+		if _, copied := s.mvStorageCopied[object.Address()]; copied {
 			// Promote: write the ADDR key now (metadata change after storage change)
 			MVWrite(s, addrKey)
 			return s.stateObjects[object.Address()]
@@ -1289,19 +1289,19 @@ func (s *StateDB) mvRecordWrittenStorageOnly(object *stateObject) *stateObject {
 		return object
 	}
 
-	if s.mvCopiedObjects != nil {
-		if _, copied := s.mvCopiedObjects[object.Address()]; copied {
+	if s.mvStorageCopied != nil {
+		if _, copied := s.mvStorageCopied[object.Address()]; copied {
 			return object
 		}
 	}
 
 	s.setStateObject(object.deepCopy(s))
 
-	if s.mvCopiedObjects == nil {
-		s.mvCopiedObjects = make(map[common.Address]struct{})
+	if s.mvStorageCopied == nil {
+		s.mvStorageCopied = make(map[common.Address]struct{})
 	}
 
-	s.mvCopiedObjects[object.Address()] = struct{}{}
+	s.mvStorageCopied[object.Address()] = struct{}{}
 
 	return s.stateObjects[object.Address()]
 }
