@@ -1253,7 +1253,7 @@ func (s *StateDB) mvRecordWritten(object *stateObject) *stateObject {
 		if _, copied := s.mvCopiedObjects[object.Address()]; copied {
 			// Promote: write the ADDR key now (metadata change after storage change)
 			MVWrite(s, addrKey)
-			return object
+			return s.stateObjects[object.Address()]
 		}
 	}
 
