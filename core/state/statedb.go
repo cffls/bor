@@ -904,6 +904,13 @@ func (s *StateDB) GetCodeHash(addr common.Address) common.Hash {
 // GetState retrieves the value associated with the specific key.
 func (s *StateDB) GetState(addr common.Address, hash common.Hash) common.Hash {
 	return MVRead(s, blockstm.NewStateKey(addr, hash), common.Hash{}, func(s *StateDB) common.Hash {
+		// Prefer local state object (deep-copied by mvRecordWritten*) over
+		// MVRead(ADDR_KEY) which might return a different tx's object.
+		// This is critical when SetState skips the ADDR key write.
+		if obj := s.stateObjects[addr]; obj != nil {
+			return obj.GetState(hash)
+		}
+
 		stateObject := s.getStateObject(addr)
 		if stateObject != nil {
 			return stateObject.GetState(hash)
@@ -917,6 +924,10 @@ func (s *StateDB) GetState(addr common.Address, hash common.Hash) common.Hash {
 // without any mutations caused in the current execution.
 func (s *StateDB) GetCommittedState(addr common.Address, hash common.Hash) common.Hash {
 	return MVRead(s, blockstm.NewStateKey(addr, hash), common.Hash{}, func(s *StateDB) common.Hash {
+		if obj := s.stateObjects[addr]; obj != nil {
+			return obj.GetCommittedState(hash)
+		}
+
 		stateObject := s.getStateObject(addr)
 		if stateObject != nil {
 			return stateObject.GetCommittedState(hash)

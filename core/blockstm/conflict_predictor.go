@@ -112,6 +112,7 @@ func (p *ConflictPredictor) EndBlock() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	p.predCache = nil // invalidate cache
 	p.blocksSinceDecay++
 
 	if p.blocksSinceDecay >= p.decayInterval {
