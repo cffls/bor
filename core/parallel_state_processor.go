@@ -400,6 +400,12 @@ func (p *ParallelStateProcessor) Process(block *types.Block, statedb *state.Stat
 	var sharedCleanStateDB *state.StateDB
 	if p.bc.opcodeLevel {
 		sharedCleanStateDB = statedb.Copy()
+
+		// With predictions, txs are chained and execute more sequentially.
+		// Cache account lookups so chained txs don't re-read from the trie.
+		if p.bc.conflictPredictor != nil {
+			sharedCleanStateDB.SetReader(state.NewCachingReader(sharedCleanStateDB.Reader()))
+		}
 	}
 
 	for i, tx := range block.Transactions() {

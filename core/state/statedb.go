@@ -1420,6 +1420,11 @@ func (s *StateDB) Copy() *StateDB {
 	return state
 }
 
+// SetReader replaces the state reader (used to inject caching readers for parallel execution).
+func (s *StateDB) SetReader(r Reader) {
+	s.reader = r
+}
+
 // CopyForExecution creates a lightweight copy optimized for BlockSTM parallel
 // execution. It assumes the source is a clean base state (no logs, no preimages,
 // empty access list/transient storage/journal) and skips unnecessary allocations.
