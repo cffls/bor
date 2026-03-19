@@ -3,6 +3,7 @@ package blockstm
 import (
 	"context"
 	"fmt"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -66,17 +67,15 @@ type OpcodeLevelExecutor struct {
 	activeWorkers atomic.Int32
 
 	// Opcode-level metrics (atomic — incremented from worker goroutines)
-	cntSuspensions     atomic.Int64 // times a worker blocked in MVRead waiting for dependency
-	cntReplacements    atomic.Int64 // replacement workers spawned during suspensions
+	cntSuspensions  atomic.Int64 // times a worker blocked in MVRead waiting for dependency
+	cntReplacements atomic.Int64 // replacement workers spawned during suspensions
 
-	// Conflict predictions: txIndex → list of predicted conflict addresses.
+	// Pre-allocated replacement worker pool to avoid goroutine creation per suspension.
+	chReplacementWake chan struct{} // signal channel to wake idle replacement workers
+
+	// Conflict predictions: txIndex → list of predicted conflict keys.
 	// Pre-populated as FlagEstimate in MVHashMap before workers start.
-	predictions map[int][]common.Address
-
-	// Pre-written estimate keys per tx, for cleanup after execution.
-	// If a tx didn't actually write a pre-written key, it must be deleted
-	// to prevent infinite dependency loops.
-	preWrittenKeys map[int][]Key
+	predictions map[int][]Key
 
 	begin   time.Time
 	profile bool
@@ -113,6 +112,7 @@ func NewOpcodeLevelExecutor(tasks []ExecTask, profile bool, numProcs int) *Opcod
 		txIncarnations:      make([]int, numTasks),
 		estimateDeps:        make(map[int][]int),
 		preValidated:        make(map[int]bool),
+		chReplacementWake:   make(chan struct{}, numTasks),
 		begin:               time.Now(),
 		profile:             profile,
 	}
@@ -150,34 +150,44 @@ func (pe *OpcodeLevelExecutor) Prepare() error {
 		}
 	}
 
-	// Pre-populate MVHashMap with FlagEstimate for predicted conflict addresses.
-	// Track which keys were pre-written so we can clean up after execution.
+	// Chain-style dispatch dependencies from predictions.
+	// For each predicted conflict key, sort txs and chain each to its
+	// immediate predecessor. This pipelines conflicting txs correctly:
+	// tx N starts right after N-1 finishes, executes once without VFail.
+	// Independent chains and non-predicted txs run fully in parallel.
 	if pe.predictions != nil {
-		pe.preWrittenKeys = make(map[int][]Key)
+		keyTxs := make(map[Key][]int)
 
-		for txIdx, addrs := range pe.predictions {
-			for _, a := range addrs {
-				addrKey := NewAddressKey(a)
-				balKey := NewSubpathKey(a, SubpathBalance)
+		for txIdx, keys := range pe.predictions {
+			for _, k := range keys {
+				keyTxs[k] = append(keyTxs[k], txIdx)
+			}
+		}
 
-				pe.mvh.WriteEstimate(addrKey, Version{txIdx, 0})
-				pe.mvh.WriteEstimate(balKey, Version{txIdx, 0})
+		for _, txIdxs := range keyTxs {
+			if len(txIdxs) < 2 {
+				continue
+			}
 
-				pe.preWrittenKeys[txIdx] = append(pe.preWrittenKeys[txIdx], addrKey, balKey)
+			sort.Ints(txIdxs)
+
+			for i := 1; i < len(txIdxs); i++ {
+				if pe.execTasks.addDependencies(txIdxs[i-1], txIdxs[i]) {
+					pe.execTasks.clearPending(txIdxs[i])
+				}
 			}
 		}
 	}
 
-	// Set up replacement worker spawning for goroutine suspension
 	pe.mvh.SetOnWorkerSuspend(func() {
 		pe.cntSuspensions.Add(1)
 		pe.SpawnReplacementWorker()
 	})
 
-	// Launch fixed worker pool — same structure as baseline
-	pe.workerWg.Add(pe.numSpeculativeProcs + numGoProcsOL)
+	workerCount := pe.numSpeculativeProcs + numGoProcsOL
+	pe.workerWg.Add(workerCount)
 
-	for i := 0; i < pe.numSpeculativeProcs+numGoProcsOL; i++ {
+	for i := 0; i < workerCount; i++ {
 		go pe.worker(i)
 	}
 
@@ -207,52 +217,30 @@ func (pe *OpcodeLevelExecutor) Prepare() error {
 func (pe *OpcodeLevelExecutor) worker(procNum int) {
 	defer pe.workerWg.Done()
 
-	doWork := func(task ExecVersionView) {
-		pe.activeWorkers.Add(1)
-
+	execOne := func(task ExecVersionView) ExecResult {
 		start := time.Duration(0)
 		if pe.profile {
 			start = time.Since(pe.begin)
 		}
 
 		res := task.Execute()
-
-		txIdx := res.ver.TxnIndex
+		txIdx := task.ver.TxnIndex
 
 		if res.err == nil {
 			pe.mvh.FlushMVWriteSet(res.txAllOut)
 		}
 
-		// Clean up pre-written estimate keys that the tx did NOT actually write.
-		// Without this, stale FlagEstimate entries cause infinite dependency loops:
-		// a reader finds the estimate, waits, resumes, re-reads the same estimate.
-		if preKeys, ok := pe.preWrittenKeys[txIdx]; ok {
-			// Build set of keys the tx actually wrote
-			actualWrites := make(map[Key]struct{}, len(res.txAllOut))
-			for _, w := range res.txAllOut {
-				actualWrites[w.Path] = struct{}{}
-			}
-
-			// Delete pre-written keys that weren't actually written
-			for _, pk := range preKeys {
-				if _, wrote := actualWrites[pk]; !wrote {
-					pe.mvh.Delete(pk, txIdx)
-				}
-			}
-		}
-
-		// Notify completion so goroutines suspended in MVRead can resume
 		pe.mvh.NotifyCompletion(txIdx)
 
-		pe.resultQueue.Push(res.ver.TxnIndex, res)
+		pe.resultQueue.Push(txIdx, res)
 		pe.chResults <- struct{}{}
 
 		if pe.profile {
 			end := time.Since(pe.begin)
 
 			pe.statsMutex.Lock()
-			pe.stats[res.ver.TxnIndex] = ExecutionStat{
-				TxIdx:       res.ver.TxnIndex,
+			pe.stats[txIdx] = ExecutionStat{
+				TxIdx:       txIdx,
 				Incarnation: res.ver.Incarnation,
 				Start:       uint64(start),
 				End:         uint64(end),
@@ -261,12 +249,18 @@ func (pe *OpcodeLevelExecutor) worker(procNum int) {
 			pe.statsMutex.Unlock()
 		}
 
+		return res
+	}
+
+	doWork := func(task ExecVersionView) {
+		pe.activeWorkers.Add(1)
+
+		execOne(task)
 		pe.activeWorkers.Add(-1)
 	}
 
 	if procNum < pe.numSpeculativeProcs {
 		for range pe.chSpeculativeTasks {
-			// Use TryPop: a replacement worker may have stolen the task.
 			taskVal := pe.specTaskQueue.(*SafePriorityQueue).TryPop()
 			if taskVal == nil {
 				continue
@@ -468,7 +462,12 @@ func (pe *OpcodeLevelExecutor) Step(res *ExecResult) (result ParallelExecutionRe
 			deps = BuildDAG(*pe.lastTxIO)
 		}
 
-		return ParallelExecutionResult{TxIO: pe.lastTxIO, Stats: &pe.stats, Deps: &deps, AllDeps: allDeps, Aborts: pe.cntAbort, Suspensions: pe.cntSuspensions.Load()}, err
+		return ParallelExecutionResult{
+			TxIO: pe.lastTxIO, Stats: &pe.stats, Deps: &deps, AllDeps: allDeps,
+			Aborts: pe.cntAbort, Suspensions: pe.cntSuspensions.Load(),
+			Executions: pe.cntExec, ValidationFails: pe.cntValidationFail,
+			Replacements: pe.cntReplacements.Load(),
+		}, err
 	}
 
 	// Dispatch next guaranteed task
@@ -495,9 +494,8 @@ func (pe *OpcodeLevelExecutor) Step(res *ExecResult) (result ParallelExecutionRe
 	return
 }
 
-// SpawnReplacementWorker is called by MVRead (via MVHashMap) when a worker is
-// about to block on a dependency. It spawns a temporary worker that processes
-// one task from the speculative queue, preventing pool exhaustion.
+// SpawnReplacementWorker is called when a worker suspends in MVRead.
+// Non-blocking: picks up a queued task if available, otherwise exits.
 func (pe *OpcodeLevelExecutor) SpawnReplacementWorker() {
 	pe.cntReplacements.Add(1)
 	pe.workerWg.Add(1)
@@ -505,57 +503,41 @@ func (pe *OpcodeLevelExecutor) SpawnReplacementWorker() {
 	go func() {
 		defer pe.workerWg.Done()
 
-		// Try to pick up a speculative task. If none available, exit.
 		select {
 		case <-pe.chSpeculativeTasks:
-			// Use TryPop: another worker may have consumed the task
-			// between the channel signal and this Pop.
 			taskVal := pe.specTaskQueue.(*SafePriorityQueue).TryPop()
 			if taskVal == nil {
-				// Another worker already consumed the task — nothing to do.
 				return
 			}
 
-			task := taskVal.(ExecVersionView)
-
-			pe.activeWorkers.Add(1)
-
-			res := task.Execute()
-
-			txIdx := res.ver.TxnIndex
-
-			if res.err == nil {
-				pe.mvh.FlushMVWriteSet(res.txAllOut)
-			}
-
-			// Clean up stale pre-written estimates (same as doWork)
-			if preKeys, ok := pe.preWrittenKeys[txIdx]; ok {
-				actualWrites := make(map[Key]struct{}, len(res.txAllOut))
-				for _, w := range res.txAllOut {
-					actualWrites[w.Path] = struct{}{}
-				}
-
-				for _, pk := range preKeys {
-					if _, wrote := actualWrites[pk]; !wrote {
-						pe.mvh.Delete(pk, txIdx)
-					}
-				}
-			}
-
-			pe.mvh.NotifyCompletion(txIdx)
-			pe.resultQueue.Push(txIdx, res)
-			pe.chResults <- struct{}{}
-
-			pe.activeWorkers.Add(-1)
+			pe.doReplacementWork(taskVal.(ExecVersionView))
 		default:
-			// No work available
 		}
 	}()
 }
 
+// doReplacementWork executes a single task from a replacement worker.
+func (pe *OpcodeLevelExecutor) doReplacementWork(task ExecVersionView) {
+	pe.activeWorkers.Add(1)
+
+	txIdx := task.ver.TxnIndex
+
+	res := task.Execute()
+
+	if res.err == nil {
+		pe.mvh.FlushMVWriteSet(res.txAllOut)
+	}
+
+	pe.mvh.NotifyCompletion(txIdx)
+	pe.resultQueue.Push(txIdx, res)
+	pe.chResults <- struct{}{}
+
+	pe.activeWorkers.Add(-1)
+}
+
 type PropertyCheckOL func(*OpcodeLevelExecutor) error
 
-func executeOpcodeLevelWithCheck(tasks []ExecTask, profile bool, numProcs int, predictions map[int][]common.Address, interruptCtx context.Context) (result ParallelExecutionResult, err error) {
+func executeOpcodeLevelWithCheck(tasks []ExecTask, profile bool, numProcs int, predictions map[int][]Key, interruptCtx context.Context) (result ParallelExecutionResult, err error) {
 	if len(tasks) == 0 {
 		return ParallelExecutionResult{TxIO: MakeTxnInputOutput(len(tasks))}, nil
 	}
@@ -591,6 +573,6 @@ func executeOpcodeLevelWithCheck(tasks []ExecTask, profile bool, numProcs int, p
 	return
 }
 
-func ExecuteParallelOpcodeLevel(tasks []ExecTask, profile bool, numProcs int, predictions map[int][]common.Address, interruptCtx context.Context) (result ParallelExecutionResult, err error) {
+func ExecuteParallelOpcodeLevel(tasks []ExecTask, profile bool, numProcs int, predictions map[int][]Key, interruptCtx context.Context) (result ParallelExecutionResult, err error) {
 	return executeOpcodeLevelWithCheck(tasks, profile, numProcs, predictions, interruptCtx)
 }

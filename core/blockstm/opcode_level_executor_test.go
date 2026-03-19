@@ -130,7 +130,6 @@ func (t *opcodeLevelExecTask) Settle()                  {}
 func (t *opcodeLevelExecTask) Sender() common.Address   { return t.sender }
 func (t *opcodeLevelExecTask) Hash() common.Hash        { return common.BytesToHash([]byte(fmt.Sprintf("%d", t.txIdx))) }
 func (t *opcodeLevelExecTask) Dependencies() []int       { return t.dependencies }
-
 func runOpcodeLevel(t *testing.T, tasks []ExecTask) time.Duration {
 	t.Helper()
 

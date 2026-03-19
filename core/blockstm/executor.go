@@ -183,8 +183,11 @@ type ParallelExecutionResult struct {
 	AllDeps map[int]map[int]bool
 
 	// Opcode-level metrics (only populated by OpcodeLevelExecutor)
-	Aborts      int
-	Suspensions int64
+	Aborts          int
+	Suspensions     int64
+	Executions      int   // total Execute() calls (tasks + re-executions)
+	ValidationFails int   // validation failures that triggered re-execution
+	Replacements    int64 // replacement workers spawned/woken
 }
 
 const numGoProcs = 1

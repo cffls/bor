@@ -58,6 +58,25 @@ func (m *taskStatusManager) takeNextPending() int {
 	return x
 }
 
+// tryTakeInProgress attempts to claim a specific tx for execution.
+// Returns true if the tx was pending (no unresolved blockers) and is
+// now in-progress. Returns false if the tx is blocked, already in progress,
+// or already complete.
+func (m *taskStatusManager) tryTakeInProgress(tx int) bool {
+	if m.isBlocked(tx) || m.checkInProgress(tx) || m.checkComplete(tx) {
+		return false
+	}
+
+	if !m.checkPending(tx) {
+		return false
+	}
+
+	m.pending = removeFromList(m.pending, tx, false)
+	m.inProgress = insertInList(m.inProgress, tx)
+
+	return true
+}
+
 func hasNoGap(l []int) bool {
 	return l[0]+len(l) == l[len(l)-1]+1
 }
@@ -84,7 +103,7 @@ func (m *taskStatusManager) pushPending(tx int) {
 
 func removeFromList(l []int, v int, expect bool) []int {
 	x := sort.SearchInts(l, v)
-	if x == -1 || l[x] != v {
+	if x == -1 || x >= len(l) || l[x] != v {
 		if expect {
 			panic(fmt.Errorf("should not happen - element expected in list"))
 		}

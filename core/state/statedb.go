@@ -1387,6 +1387,35 @@ func (s *StateDB) Copy() *StateDB {
 	return state
 }
 
+// CopyForExecution creates a lightweight copy optimized for BlockSTM parallel
+// execution. It assumes the source is a clean base state (no logs, no preimages,
+// empty access list/transient storage/journal) and skips unnecessary allocations.
+func (s *StateDB) CopyForExecution() *StateDB {
+	state := &StateDB{
+		db:           s.db,
+		reader:       s.reader,
+		originalRoot: s.originalRoot,
+		// Pre-size maps to 0 — they'll grow on demand. Most parallel txs
+		// touch 5-20 accounts, so avoiding large pre-allocation saves memory.
+		stateObjects:         make(map[common.Address]*stateObject, len(s.stateObjects)),
+		stateObjectsDestruct: make(map[common.Address]*stateObject, 0),
+		revertedKeys:         make(map[blockstm.Key]struct{}, 0),
+		mutations:            make(map[common.Address]*mutation, 0),
+		logs:                 make(map[common.Hash][]*types.Log, 1),
+		accessList:           newAccessList(),
+		transientStorage:     newTransientStorage(),
+		journal:              newJournal(),
+	}
+	if s.trie != nil {
+		state.trie = mustCopyTrie(s.trie)
+	}
+	for addr, obj := range s.stateObjects {
+		state.stateObjects[addr] = obj.deepCopy(state)
+	}
+
+	return state
+}
+
 // Snapshot returns an identifier for the current revision of the state.
 func (s *StateDB) Snapshot() int {
 	return s.journal.snapshot()

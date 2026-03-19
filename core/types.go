@@ -21,6 +21,7 @@ import (
 	"sync/atomic"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/blockstm"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
@@ -59,4 +60,12 @@ type ProcessResult struct {
 	Requests [][]byte
 	Logs     []*types.Log
 	GasUsed  uint64
+
+	// BlockSTM metrics (only populated by ParallelStateProcessor)
+	BlockSTMAborts          int
+	BlockSTMSuspensions     int64
+	BlockSTMExecutions      int
+	BlockSTMValidationFails int
+	BlockSTMReplacements    int64
+	BlockSTMTxIO            *blockstm.TxnInputOutput // read/write sets per tx (for analysis)
 }

@@ -133,7 +133,6 @@ func (t *lateConflictTask) Hash() common.Hash {
 	return common.BytesToHash([]byte(fmt.Sprintf("%d", t.txIdx)))
 }
 func (t *lateConflictTask) Dependencies() []int { return t.dependencies }
-
 // makeLateConflictTasks creates numTx transactions from distinct senders that
 // all read/write a shared key AFTER doing independentWork of computation.
 // This is the ideal scenario for opcode-level BlockSTM: the baseline must

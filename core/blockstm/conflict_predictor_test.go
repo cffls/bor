@@ -17,21 +17,49 @@ func addr(i int) common.Address {
 	return common.BigToAddress(big.NewInt(int64(i)))
 }
 
+// stateKey creates a storage slot key for testing (most common conflict type).
+func stateKey(addrIdx, slotIdx int) Key {
+	return NewStateKey(addr(addrIdx), common.BigToHash(big.NewInt(int64(slotIdx))))
+}
+
+// balKey creates a balance subpath key for testing.
+func balKey(addrIdx int) Key {
+	return NewSubpathKey(addr(addrIdx), SubpathBalance)
+}
+
 func TestConflictPredictorBasic(t *testing.T) {
 	p := NewConflictPredictor()
 
 	router := addr(1)
-	pool := addr(2)
+	poolSlot := stateKey(2, 0) // storage slot 0 of contract 2
 
 	// First observation — below threshold (2)
-	p.Record(router, pool)
+	p.Record(router, poolSlot)
 	assert.Empty(t, p.Predict(router), "should not predict after 1 observation")
 
 	// Second observation — meets threshold
-	p.Record(router, pool)
+	p.Record(router, poolSlot)
 	predicted := p.Predict(router)
 	require.Len(t, predicted, 1)
-	assert.Equal(t, pool, predicted[0])
+	assert.Equal(t, poolSlot, predicted[0])
+}
+
+func TestConflictPredictorSkipsAddressKeys(t *testing.T) {
+	p := NewConflictPredictor()
+
+	router := addr(1)
+	addrKey := NewAddressKey(addr(2)) // address-type key — structural, not real conflict
+
+	// Address keys should be filtered out in Record
+	p.Record(router, addrKey)
+	p.Record(router, addrKey)
+	assert.Empty(t, p.Predict(router), "address keys should be skipped")
+
+	// But state keys and subpath keys are recorded
+	slotKey := stateKey(2, 0)
+	p.Record(router, slotKey)
+	p.Record(router, slotKey)
+	assert.Len(t, p.Predict(router), 1, "state keys should be recorded")
 }
 
 func TestConflictPredictorMultipleTargets(t *testing.T) {
@@ -39,58 +67,46 @@ func TestConflictPredictorMultipleTargets(t *testing.T) {
 
 	routerA := addr(1)
 	routerB := addr(2)
-	pool := addr(3)
+	poolSlot := stateKey(3, 0)
 
-	// Both routers conflict on the same pool
-	p.Record(routerA, pool)
-	p.Record(routerA, pool)
-	p.Record(routerB, pool)
-	p.Record(routerB, pool)
+	// Both routers conflict on the same pool slot
+	p.Record(routerA, poolSlot)
+	p.Record(routerA, poolSlot)
+	p.Record(routerB, poolSlot)
+	p.Record(routerB, poolSlot)
 
 	predictedA := p.Predict(routerA)
 	predictedB := p.Predict(routerB)
 
 	require.Len(t, predictedA, 1)
 	require.Len(t, predictedB, 1)
-	assert.Equal(t, pool, predictedA[0])
-	assert.Equal(t, pool, predictedB[0])
+	assert.Equal(t, poolSlot, predictedA[0])
+	assert.Equal(t, poolSlot, predictedB[0])
 }
 
 func TestConflictPredictorMultipleConflicts(t *testing.T) {
 	p := NewConflictPredictor()
 
 	router := addr(1)
-	poolA := addr(2)
-	poolB := addr(3)
+	slotA := stateKey(2, 0)
+	slotB := stateKey(3, 0)
 
-	// Router conflicts with two different pools
-	p.Record(router, poolA)
-	p.Record(router, poolA)
-	p.Record(router, poolB)
-	p.Record(router, poolB)
+	// Router conflicts with two different slots
+	p.Record(router, slotA)
+	p.Record(router, slotA)
+	p.Record(router, slotB)
+	p.Record(router, slotB)
 
 	predicted := p.Predict(router)
 	require.Len(t, predicted, 2)
 
-	addrs := map[common.Address]bool{}
-	for _, a := range predicted {
-		addrs[a] = true
+	keys := map[Key]bool{}
+	for _, k := range predicted {
+		keys[k] = true
 	}
 
-	assert.True(t, addrs[poolA])
-	assert.True(t, addrs[poolB])
-}
-
-func TestConflictPredictorSelfReference(t *testing.T) {
-	p := NewConflictPredictor()
-
-	router := addr(1)
-
-	// Self-references are skipped
-	p.Record(router, router)
-	p.Record(router, router)
-
-	assert.Empty(t, p.Predict(router))
+	assert.True(t, keys[slotA])
+	assert.True(t, keys[slotB])
 }
 
 func TestConflictPredictorUnknownTarget(t *testing.T) {
@@ -104,13 +120,13 @@ func TestConflictPredictorDecay(t *testing.T) {
 	p.decayInterval = 4 // decay every 4 blocks for testing
 
 	router := addr(1)
-	pool := addr(2)
+	poolSlot := stateKey(2, 0)
 
 	// Count = 4 (above threshold)
-	p.Record(router, pool)
-	p.Record(router, pool)
-	p.Record(router, pool)
-	p.Record(router, pool)
+	p.Record(router, poolSlot)
+	p.Record(router, poolSlot)
+	p.Record(router, poolSlot)
+	p.Record(router, poolSlot)
 	assert.Len(t, p.Predict(router), 1, "count=4, should predict")
 
 	// Trigger decay: count 4 → 2 (still above threshold)
@@ -144,11 +160,11 @@ func TestConflictPredictorPrePopulation(t *testing.T) {
 	p := NewConflictPredictor()
 
 	router := addr(1)
-	pool := addr(2)
+	poolSlot := stateKey(2, 0)
 
 	// Train the predictor
-	p.Record(router, pool)
-	p.Record(router, pool)
+	p.Record(router, poolSlot)
+	p.Record(router, poolSlot)
 
 	predicted := p.Predict(router)
 	require.Len(t, predicted, 1)
@@ -156,25 +172,23 @@ func TestConflictPredictorPrePopulation(t *testing.T) {
 	// Simulate what the executor does: pre-populate MVHashMap
 	mvh := MakeMVHashMap()
 
-	for _, conflictAddr := range predicted {
-		mvh.WriteEstimate(NewAddressKey(conflictAddr), Version{0, 0})
-		mvh.WriteEstimate(NewSubpathKey(conflictAddr, SubpathBalance), Version{0, 0})
+	for _, k := range predicted {
+		mvh.WriteEstimate(k, Version{0, 0})
 	}
 
-	// Verify: reading the address key from tx 1 should find FlagEstimate from tx 0
-	addrResult := mvh.Read(NewAddressKey(pool), 1)
-	assert.Equal(t, MVReadResultDependency, addrResult.Status(),
-		"should detect dependency on pre-populated address key")
-	assert.Equal(t, 0, addrResult.DepIdx())
+	// Verify: reading the exact key from tx 1 should find FlagEstimate from tx 0
+	slotResult := mvh.Read(poolSlot, 1)
+	assert.Equal(t, MVReadResultDependency, slotResult.Status(),
+		"should detect dependency on pre-populated state key")
+	assert.Equal(t, 0, slotResult.DepIdx())
 
-	// Verify: reading the balance key from tx 1 should also find FlagEstimate
-	balResult := mvh.Read(NewSubpathKey(pool, SubpathBalance), 1)
-	assert.Equal(t, MVReadResultDependency, balResult.Status(),
-		"should detect dependency on pre-populated balance key")
+	// Verify: reading the ADDRESS key (not predicted) should NOT find a dependency
+	addrResult := mvh.Read(NewAddressKey(addr(2)), 1)
+	assert.Equal(t, MVReadResultNone, addrResult.Status(),
+		"address key should NOT be predicted — only exact conflict keys")
 
 	// Verify: reading from tx 0 itself should NOT find a dependency
-	// (floor(0-1) = floor(-1) returns nil)
-	selfResult := mvh.Read(NewAddressKey(pool), 0)
+	selfResult := mvh.Read(poolSlot, 0)
 	assert.Equal(t, MVReadResultNone, selfResult.Status(),
 		"tx 0 should not see its own estimate as a dependency")
 }
@@ -185,30 +199,30 @@ func TestConflictPredictorMultipleTxPrePopulation(t *testing.T) {
 	// the nearest lower-index tx.
 
 	mvh := MakeMVHashMap()
-	pool := addr(5)
+	poolSlot := stateKey(5, 0)
 
-	// Simulate 3 txs (indices 2, 5, 8) all predicted to conflict on pool
+	// Simulate 3 txs (indices 2, 5, 8) all predicted to conflict on poolSlot
 	for _, txIdx := range []int{2, 5, 8} {
-		mvh.WriteEstimate(NewAddressKey(pool), Version{txIdx, 0})
+		mvh.WriteEstimate(poolSlot, Version{txIdx, 0})
 	}
 
 	// Tx 3 reads pool → should see FlagEstimate from tx 2
-	res3 := mvh.Read(NewAddressKey(pool), 3)
+	res3 := mvh.Read(poolSlot, 3)
 	assert.Equal(t, MVReadResultDependency, res3.Status())
 	assert.Equal(t, 2, res3.DepIdx())
 
 	// Tx 6 reads pool → should see FlagEstimate from tx 5
-	res6 := mvh.Read(NewAddressKey(pool), 6)
+	res6 := mvh.Read(poolSlot, 6)
 	assert.Equal(t, MVReadResultDependency, res6.Status())
 	assert.Equal(t, 5, res6.DepIdx())
 
 	// Tx 9 reads pool → should see FlagEstimate from tx 8
-	res9 := mvh.Read(NewAddressKey(pool), 9)
+	res9 := mvh.Read(poolSlot, 9)
 	assert.Equal(t, MVReadResultDependency, res9.Status())
 	assert.Equal(t, 8, res9.DepIdx())
 
 	// Tx 1 reads pool → should see nothing (no estimate with index < 1 that's ≤ 0)
-	res1 := mvh.Read(NewAddressKey(pool), 1)
+	res1 := mvh.Read(poolSlot, 1)
 	assert.Equal(t, MVReadResultNone, res1.Status(),
 		"tx before first estimate should read from storage")
 }
@@ -218,8 +232,7 @@ func TestConflictPredictorWriteOverridesEstimate(t *testing.T) {
 	// with FlagDone, so subsequent readers get the actual value.
 
 	mvh := MakeMVHashMap()
-	pool := addr(5)
-	key := NewAddressKey(pool)
+	key := stateKey(5, 0)
 
 	// Pre-populate estimate
 	mvh.WriteEstimate(key, Version{3, 0})
@@ -257,12 +270,13 @@ func TestConflictPredictorReducesReExecution(t *testing.T) {
 	noPredResult, err := ExecuteParallelOpcodeLevel(noPredTasks, false, highProcs, nil, nil)
 	require.NoError(t, err)
 
-	// Run WITH predictions — pre-populate FlagEstimate for the shared key address
+	// Run WITH predictions — pre-populate FlagEstimate for the shared key
 	sharedAddr := common.BigToAddress(big.NewInt(999)) // matches makeLateConflictTasks
-	predictions := make(map[int][]common.Address)
+	sharedKey := NewSubpathKey(sharedAddr, SubpathBalance)
+	predictions := make(map[int][]Key)
 
 	for i := 0; i < numTx; i++ {
-		predictions[i] = []common.Address{sharedAddr}
+		predictions[i] = []Key{sharedKey}
 	}
 
 	predTasks := makeLateConflictTasks(numTx, workDuration, true)
@@ -274,12 +288,11 @@ func TestConflictPredictorReducesReExecution(t *testing.T) {
 	fmt.Printf("With predictions:    aborts=%d, suspensions=%d\n",
 		predResult.Aborts, predResult.Suspensions)
 
-	// With predictions, more conflicts should be resolved via suspension (blocking)
-	// instead of stale reads followed by validation failure (aborts).
-	assert.GreaterOrEqual(t, predResult.Suspensions, noPredResult.Suspensions,
-		"predictions should increase or maintain suspensions")
-	assert.LessOrEqual(t, predResult.Aborts, noPredResult.Aborts,
-		"predictions should reduce or maintain aborts")
+	// With dispatch-dependency predictions, conflicting txs are serialized via
+	// dispatch ordering. This reduces both suspensions (fewer concurrent conflicts)
+	// and validation failures (correct execution order).
+	assert.LessOrEqual(t, predResult.ValidationFails, noPredResult.ValidationFails,
+		"predictions should reduce or maintain validation failures")
 
 	// Also compare with baseline (no suspension) to show predictions help there too.
 	// Baseline tasks abort on dependency instead of suspending.
@@ -304,10 +317,10 @@ func TestConflictPredictorConcurrentAccess(t *testing.T) {
 			defer wg.Done()
 
 			router := addr(id)
-			pool := addr(100 + id%3)
+			poolSlot := stateKey(100+id%3, 0)
 
 			for j := 0; j < 100; j++ {
-				p.Record(router, pool)
+				p.Record(router, poolSlot)
 			}
 		}(i)
 	}

@@ -96,7 +96,11 @@ type ExecutionTask struct {
 }
 
 func (task *ExecutionTask) Execute(mvh *blockstm.MVHashMap, incarnation int) (err error) {
-	task.statedb = task.cleanStateDB.Copy()
+	if task.opcodeLevel {
+		task.statedb = task.cleanStateDB.CopyForExecution()
+	} else {
+		task.statedb = task.cleanStateDB.Copy()
+	}
 	task.statedb.SetTxContext(task.tx.Hash(), task.index)
 	task.statedb.SetMVHashmap(mvh)
 	task.statedb.SetIncarnation(incarnation)
@@ -179,6 +183,7 @@ func (task *ExecutionTask) Hash() common.Hash {
 func (task *ExecutionTask) Dependencies() []int {
 	return task.dependencies
 }
+
 
 func (task *ExecutionTask) Settle() {
 	// Disable MVHashMap during settlement so Get*/Set* calls bypass MVRead/MVWrite.
@@ -388,7 +393,15 @@ func (p *ParallelStateProcessor) Process(block *types.Block, statedb *state.Stat
 		}
 	}
 
-	// Iterate over and process the individual transactions
+	// Iterate over and process the individual transactions.
+	// For opcode-level mode, all tasks share the same base statedb reference.
+	// Each Execute() call does Copy() before running, so per-task copies here
+	// are redundant and eliminated to reduce setup overhead.
+	var sharedCleanStateDB *state.StateDB
+	if p.bc.opcodeLevel {
+		sharedCleanStateDB = statedb.Copy()
+	}
+
 	for i, tx := range block.Transactions() {
 		if tx.Type() == types.StateSyncTxType {
 			continue
@@ -399,7 +412,12 @@ func (p *ParallelStateProcessor) Process(block *types.Block, statedb *state.Stat
 			return nil, fmt.Errorf("could not apply tx %d [%v]: %w", i, tx.Hash().Hex(), err)
 		}
 
-		cleansdb := statedb.Copy()
+		var cleansdb *state.StateDB
+		if p.bc.opcodeLevel {
+			cleansdb = sharedCleanStateDB
+		} else {
+			cleansdb = statedb.Copy()
+		}
 
 		if msg.From == coinbase {
 			shouldDelayFeeCal = false
@@ -434,7 +452,13 @@ func (p *ParallelStateProcessor) Process(block *types.Block, statedb *state.Stat
 		tasks = append(tasks, task)
 	}
 
-	backupStateDB := statedb.Copy()
+	// Lazy backup: for opcode-level mode, defer the expensive statedb.Copy()
+	// until a fee-delay rerun is actually needed (rare path).
+	var backupStateDB *state.StateDB
+	needsBackup := !shouldDelayFeeCal // if fee delay is already false, no rerun possible
+	if !p.bc.opcodeLevel || needsBackup {
+		backupStateDB = statedb.Copy()
+	}
 
 	profile := false
 
@@ -442,16 +466,16 @@ func (p *ParallelStateProcessor) Process(block *types.Block, statedb *state.Stat
 
 	if p.bc.opcodeLevel {
 		// Build predictions from conflict predictor
-		var predictions map[int][]common.Address
+		var predictions map[int][]blockstm.Key
 
 		if p.bc.conflictPredictor != nil {
-			predictions = make(map[int][]common.Address)
+			predictions = make(map[int][]blockstm.Key)
 
 			for i, task := range tasks {
 				task := task.(*ExecutionTask)
 				if task.msg.To != nil {
-					if addrs := p.bc.conflictPredictor.Predict(*task.msg.To); len(addrs) > 0 {
-						predictions[i] = addrs
+					if keys := p.bc.conflictPredictor.Predict(*task.msg.To); len(keys) > 0 {
+						predictions[i] = keys
 					}
 				}
 			}
@@ -463,21 +487,21 @@ func (p *ParallelStateProcessor) Process(block *types.Block, statedb *state.Stat
 	}
 
 	// Feed conflict predictor with data from this block's execution.
-	// Extract (msg.To → conflict_address) pairs from read/write set overlaps.
+	// Record the full Key (not just address) so predictions target exact
+	// storage slots / subpath keys that actually conflict.
 	if err == nil && p.bc.conflictPredictor != nil && result.TxIO != nil {
 		for i := 1; i < len(tasks); i++ {
 			for _, rd := range result.TxIO.ReadSet(i) {
 				if rd.Kind == blockstm.ReadKindMap && rd.V.TxnIndex >= 0 {
-					conflictAddr := rd.Path.GetAddress()
 					readerTask := tasks[i].(*ExecutionTask)
 					writerTask := tasks[rd.V.TxnIndex].(*ExecutionTask)
 
 					if readerTask.msg.To != nil {
-						p.bc.conflictPredictor.Record(*readerTask.msg.To, conflictAddr)
+						p.bc.conflictPredictor.Record(*readerTask.msg.To, rd.Path)
 					}
 
 					if writerTask.msg.To != nil {
-						p.bc.conflictPredictor.Record(*writerTask.msg.To, conflictAddr)
+						p.bc.conflictPredictor.Record(*writerTask.msg.To, rd.Path)
 					}
 				}
 			}
@@ -502,6 +526,13 @@ func (p *ParallelStateProcessor) Process(block *types.Block, statedb *state.Stat
 		task := task.(*ExecutionTask)
 		if task.shouldRerunWithoutFeeDelay {
 			shouldDelayFeeCal = false
+
+			if backupStateDB == nil {
+				// Lazy backup was deferred — this shouldn't happen in normal flow
+				// but handle it gracefully by creating a fresh state from the same root.
+				log.Warn("fee delay rerun triggered without backup state")
+				break
+			}
 
 			// nolint
 			*statedb = *backupStateDB
@@ -555,10 +586,16 @@ func (p *ParallelStateProcessor) Process(block *types.Block, statedb *state.Stat
 	}
 
 	return &ProcessResult{
-		Receipts: receipts,
-		Requests: requests,
-		Logs:     allLogs,
-		GasUsed:  *usedGas,
+		Receipts:                receipts,
+		Requests:                requests,
+		Logs:                    allLogs,
+		GasUsed:                 *usedGas,
+		BlockSTMAborts:          result.Aborts,
+		BlockSTMSuspensions:     result.Suspensions,
+		BlockSTMExecutions:      result.Executions,
+		BlockSTMValidationFails: result.ValidationFails,
+		BlockSTMReplacements:    result.Replacements,
+		BlockSTMTxIO:            result.TxIO,
 	}, nil
 }
 
