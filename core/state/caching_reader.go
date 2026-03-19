@@ -14,6 +14,7 @@ import (
 type cachingReader struct {
 	inner    Reader
 	accounts sync.Map // common.Address → *cachedAccount
+	storage  sync.Map // storageKey → common.Hash
 }
 
 type cachedAccount struct {
@@ -51,8 +52,23 @@ func (r *cachingReader) Account(addr common.Address) (*types.StateAccount, error
 	return &cpy, err
 }
 
+type storageKey struct {
+	addr common.Address
+	slot common.Hash
+}
+
 func (r *cachingReader) Storage(addr common.Address, slot common.Hash) (common.Hash, error) {
-	return r.inner.Storage(addr, slot)
+	sk := storageKey{addr, slot}
+	if v, ok := r.storage.Load(sk); ok {
+		return v.(common.Hash), nil
+	}
+
+	val, err := r.inner.Storage(addr, slot)
+	if err == nil {
+		r.storage.Store(sk, val)
+	}
+
+	return val, err
 }
 
 // PreWarmReader populates a Reader's cache with the given addresses.
