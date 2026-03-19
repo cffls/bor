@@ -987,11 +987,9 @@ func (s *StateDB) AddBalance(addr common.Address, amount *uint256.Int, reason tr
 		return uint256.Int{}
 	}
 
-	if s.mvHashmap != nil {
-		// ensure a read balance operation is recorded in mvHashmap
-		s.GetBalance(addr)
-	}
-
+	// No GetBalance read recording: AddBalance is a blind write.
+	// The ADDR key (from mvRecordWritten) propagates the state object.
+	// The BAL key write stores the result. No BAL read → no BAL conflict.
 	stateObject = s.mvRecordWritten(stateObject)
 	MVWrite(s, blockstm.NewSubpathKey(addr, BalancePath))
 	return stateObject.AddBalance(amount)
@@ -1002,11 +1000,6 @@ func (s *StateDB) SubBalance(addr common.Address, amount *uint256.Int, reason tr
 	stateObject := s.getOrNewStateObject(addr)
 	if stateObject == nil {
 		return uint256.Int{}
-	}
-
-	if s.mvHashmap != nil {
-		// ensure a read balance operation is recorded in mvHashmap
-		s.GetBalance(addr)
 	}
 
 	stateObject = s.mvRecordWritten(stateObject)
