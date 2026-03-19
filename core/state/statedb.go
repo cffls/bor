@@ -112,8 +112,9 @@ type StateDB struct {
 	readList     []blockstm.ReadDescriptor    // append-only read set, returned directly by MVReadList
 	writeList    []blockstm.WriteDescriptor   // append-only write set
 	writeIndex   map[uint64]uint32            // cheap hash of Key → index in writeList
-	writeAddrs   map[common.Address]struct{}  // fast filter: addresses touched by writes
-	revertedKeys map[blockstm.Key]struct{}
+	writeAddrs       map[common.Address]struct{}  // fast filter: addresses touched by writes
+	revertedKeys     map[blockstm.Key]struct{}
+	mvCopiedObjects  map[common.Address]struct{} // tracks deep-copied objects without ADDR key write
 	dep          int
 
 	// Goroutine suspension support (opcode-level BlockSTM).
@@ -1053,7 +1054,8 @@ func (s *StateDB) SetCode(addr common.Address, code []byte, reason tracing.CodeC
 func (s *StateDB) SetState(addr common.Address, key, value common.Hash) common.Hash {
 	stateObject := s.getOrNewStateObject(addr)
 	if stateObject != nil {
-		stateObject = s.mvRecordWritten(stateObject)
+		// Storage-only: skip ADDR key write. StateKey tracks the slot dependency.
+		stateObject = s.mvRecordWrittenStorageOnly(stateObject)
 		MVWrite(s, blockstm.NewStateKey(addr, key))
 		return stateObject.SetState(key, value)
 	}
@@ -1240,9 +1242,8 @@ func (s *StateDB) getOrNewStateObject(addr common.Address) *stateObject {
 	return obj
 }
 
-// mvRecordWritten checks whether a state object is already present in the current MV writeMap.
-// If yes, it returns the object directly.
-// If not, it clones the object and inserts it into the writeMap before returning it.
+// mvRecordWritten deep-copies a state object for isolation and writes the ADDR
+// key to the MV write list for dependency tracking.
 func (s *StateDB) mvRecordWritten(object *stateObject) *stateObject {
 	if s.mvHashmap == nil {
 		return object
@@ -1254,10 +1255,49 @@ func (s *StateDB) mvRecordWritten(object *stateObject) *stateObject {
 		return object
 	}
 
-	// Deepcopy is needed to ensure that objects are not written by multiple transactions at the same time, because
-	// the input state object can come from a different transaction.
+	// Check if already deep-copied by a storage-only operation
+	if s.mvCopiedObjects != nil {
+		if _, copied := s.mvCopiedObjects[object.Address()]; copied {
+			// Promote: write the ADDR key now (metadata change after storage change)
+			MVWrite(s, addrKey)
+			return object
+		}
+	}
+
 	s.setStateObject(object.deepCopy(s))
 	MVWrite(s, addrKey)
+
+	return s.stateObjects[object.Address()]
+}
+
+// mvRecordWrittenStorageOnly deep-copies the state object for isolation but
+// does NOT write the ADDR key. Used by SetState where only a storage slot
+// changes — the StateKey tracks the dependency, not the ADDR key.
+// This eliminates false ADDR conflicts between txs writing different slots.
+func (s *StateDB) mvRecordWrittenStorageOnly(object *stateObject) *stateObject {
+	if s.mvHashmap == nil {
+		return object
+	}
+
+	addrKey := blockstm.NewAddressKey(object.Address())
+
+	if MVWritten(s, addrKey) {
+		return object
+	}
+
+	if s.mvCopiedObjects != nil {
+		if _, copied := s.mvCopiedObjects[object.Address()]; copied {
+			return object
+		}
+	}
+
+	s.setStateObject(object.deepCopy(s))
+
+	if s.mvCopiedObjects == nil {
+		s.mvCopiedObjects = make(map[common.Address]struct{})
+	}
+
+	s.mvCopiedObjects[object.Address()] = struct{}{}
 
 	return s.stateObjects[object.Address()]
 }
