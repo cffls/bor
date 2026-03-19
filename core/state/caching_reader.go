@@ -55,6 +55,13 @@ func (r *cachingReader) Storage(addr common.Address, slot common.Hash) (common.H
 	return r.inner.Storage(addr, slot)
 }
 
+// PreWarmReader populates a Reader's cache with the given addresses.
+func PreWarmReader(reader Reader, addrs []common.Address) {
+	for _, addr := range addrs {
+		reader.Account(addr)
+	}
+}
+
 func (r *cachingReader) Code(addr common.Address, codeHash common.Hash) ([]byte, error) {
 	return r.inner.Code(addr, codeHash)
 }

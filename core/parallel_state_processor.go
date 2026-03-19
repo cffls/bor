@@ -401,11 +401,22 @@ func (p *ParallelStateProcessor) Process(block *types.Block, statedb *state.Stat
 	if p.bc.opcodeLevel {
 		sharedCleanStateDB = statedb.Copy()
 
-		// With predictions, txs are chained and execute more sequentially.
-		// Cache account lookups so chained txs don't re-read from the trie.
-		if p.bc.conflictPredictor != nil {
-			sharedCleanStateDB.SetReader(state.NewCachingReader(sharedCleanStateDB.Reader()))
+		// Cache account lookups so parallel txs don't re-read from the trie.
+		cachingReader := state.NewCachingReader(sharedCleanStateDB.Reader())
+		sharedCleanStateDB.SetReader(cachingReader)
+
+		// Pre-warm the cache with all sender/recipient addresses.
+		addrs := make([]common.Address, 0, len(block.Transactions())*2)
+		for _, tx := range block.Transactions() {
+			if tx.To() != nil {
+				addrs = append(addrs, *tx.To())
+			}
+
+			from, _ := types.Sender(signer, tx)
+			addrs = append(addrs, from)
 		}
+
+		state.PreWarmReader(cachingReader, addrs)
 	}
 
 	for i, tx := range block.Transactions() {
