@@ -33,6 +33,9 @@ type ConflictPredictor struct {
 
 	// Decay interval in blocks
 	decayInterval uint64
+
+	// Cached predictions (invalidated on Record/EndBlock)
+	predCache map[common.Address][]Key
 }
 
 func NewConflictPredictor() *ConflictPredictor {
@@ -58,6 +61,8 @@ func (p *ConflictPredictor) Record(msgTo common.Address, conflictKey Key) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	p.predCache = nil // invalidate cache
+
 	if p.mappings[msgTo] == nil {
 		p.mappings[msgTo] = make(map[Key]uint32)
 	}
@@ -71,6 +76,13 @@ func (p *ConflictPredictor) Predict(msgTo common.Address) []Key {
 	p.mu.RLock()
 	defer p.mu.RUnlock()
 
+	// Check cache first
+	if p.predCache != nil {
+		if cached, ok := p.predCache[msgTo]; ok {
+			return cached
+		}
+	}
+
 	conflicts := p.mappings[msgTo]
 	if len(conflicts) == 0 {
 		return nil
@@ -83,6 +95,13 @@ func (p *ConflictPredictor) Predict(msgTo common.Address) []Key {
 			result = append(result, key)
 		}
 	}
+
+	// Cache the result
+	if p.predCache == nil {
+		p.predCache = make(map[common.Address][]Key)
+	}
+
+	p.predCache[msgTo] = result
 
 	return result
 }

@@ -1443,6 +1443,12 @@ func (s *StateDB) CopyForExecution() *StateDB {
 		accessList:           newAccessList(),
 		transientStorage:     newTransientStorage(),
 		journal:              newJournal(),
+		// Pre-allocate read/write tracking for parallel execution.
+		// Avoids lazy allocation + GC pressure during hot execution path.
+		readList:   make([]blockstm.ReadDescriptor, 0, 64),
+		writeList:  make([]blockstm.WriteDescriptor, 0, 24),
+		writeIndex: make(map[uint64]uint32, 24),
+		writeAddrs: make(map[common.Address]struct{}, 8),
 	}
 	if s.trie != nil {
 		state.trie = mustCopyTrie(s.trie)
