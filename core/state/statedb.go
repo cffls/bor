@@ -1465,8 +1465,11 @@ func (s *StateDB) CopyForExecution() *StateDB {
 		state.trie = mustCopyTrie(s.trie)
 	}
 
+	// Share state objects as read-only references (not deep copies).
+	// mvRecordWritten deep-copies on first write (copy-on-write).
+	// Thread-safe: Code() uses sync.Once, GetCommittedState uses storageMutex.
 	for addr, obj := range s.stateObjects {
-		state.stateObjects[addr] = obj.deepCopy(state)
+		state.stateObjects[addr] = obj
 	}
 
 	return state
