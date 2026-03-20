@@ -787,17 +787,23 @@ func (bc *BlockChain) ProcessBlock(block *types.Block, parent *types.Header, wit
 		accountHitFromPrefetchUniqueMeter.Mark(processStats.AccountHitFromPrefetchUnique)
 	}()
 
-	go func(start time.Time, throwaway *state.StateDB, block *types.Block) {
-		// Disable tracing for prefetcher executions.
-		vmCfg := bc.cfg.VmConfig
-		vmCfg.Tracer = nil
-		bc.prefetcher.Prefetch(block, throwaway, vmCfg, false, followupInterrupt)
+	// Skip prefetcher when opcode-level BlockSTM is active.
+	// BlockSTM + caching reader already handles state access efficiently.
+	// The prefetcher competes for memory bandwidth and CPU cache without
+	// benefiting the parallel execution path.
+	if !bc.opcodeLevel {
+		go func(start time.Time, throwaway *state.StateDB, block *types.Block) {
+			// Disable tracing for prefetcher executions.
+			vmCfg := bc.cfg.VmConfig
+			vmCfg.Tracer = nil
+			bc.prefetcher.Prefetch(block, throwaway, vmCfg, false, followupInterrupt)
 
-		blockPrefetchExecuteTimer.Update(time.Since(start))
-		if followupInterrupt.Load() {
-			blockPrefetchInterruptMeter.Mark(1)
-		}
-	}(time.Now(), throwaway, block)
+			blockPrefetchExecuteTimer.Update(time.Since(start))
+			if followupInterrupt.Load() {
+				blockPrefetchInterruptMeter.Mark(1)
+			}
+		}(time.Now(), throwaway, block)
+	}
 
 	type Result struct {
 		receipts types.Receipts
