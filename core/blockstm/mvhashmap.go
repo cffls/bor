@@ -161,6 +161,15 @@ type MVHashMap struct {
 	onWorkerSuspend func()
 }
 
+// closedSentinel is a pre-closed channel reused as the "completed" marker in
+// NotifyCompletion, avoiding a per-tx channel allocation + close.
+var closedSentinel = func() chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+
+	return ch
+}()
+
 func MakeMVHashMap() *MVHashMap {
 	mv := &MVHashMap{
 		shutdownCh: make(chan struct{}),
@@ -183,29 +192,26 @@ func (mv *MVHashMap) WaitForTx(txIdx int) <-chan struct{} {
 // NotifyCompletion unblocks all goroutines waiting for tx txIdx and ensures
 // future WaitForTx calls return immediately (pre-closed channel in the map).
 func (mv *MVHashMap) NotifyCompletion(txIdx int) {
-	// Create a pre-closed channel. If no entry exists yet, this is stored so
-	// future WaitForTx calls find it and unblock immediately.
-	closedCh := make(chan struct{})
-	close(closedCh)
-
-	actual, loaded := mv.completionChans.LoadOrStore(txIdx, closedCh)
+	// Fast path: store the shared closedSentinel. If no waiter exists,
+	// this avoids allocating a per-tx channel entirely.
+	actual, loaded := mv.completionChans.LoadOrStore(txIdx, closedSentinel)
 	if loaded {
-		// Entry already existed (from a prior WaitForTx or ResetCompletion).
-		// Close it if not already closed.
 		ch := actual.(chan struct{})
+		if ch == closedSentinel {
+			return // already completed (e.g. from a prior incarnation)
+		}
 
+		// A waiter or ResetCompletion created a fresh channel — close it.
 		select {
 		case <-ch:
-			// Already closed — also store our pre-closed channel to ensure
-			// the map entry is definitely closed (ResetCompletion may have
-			// replaced a closed channel with an open one that was then closed,
-			// but Swap ensures the latest state is closed).
+			// Already closed
 		default:
 			close(ch)
 		}
+
+		// Replace with sentinel so future WaitForTx calls return immediately.
+		mv.completionChans.Store(txIdx, closedSentinel)
 	}
-	// If !loaded, the pre-closed channel was stored. Future WaitForTx calls
-	// will find it via LoadOrStore and unblock immediately.
 }
 
 // ResetCompletion creates a fresh channel for txIdx so that future waiters

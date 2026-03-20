@@ -123,6 +123,16 @@ func (q *SafeFIFOQueue) Len() int {
 	return len(q.c)
 }
 
+// TryPop returns the next item without blocking. Returns nil if empty.
+func (q *SafeFIFOQueue) TryPop() interface{} {
+	select {
+	case v := <-q.c:
+		return v
+	default:
+		return nil
+	}
+}
+
 // A thread safe priority queue
 type SafePriorityQueue struct {
 	m     sync.Mutex

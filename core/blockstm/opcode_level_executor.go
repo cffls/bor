@@ -253,10 +253,7 @@ func (pe *OpcodeLevelExecutor) worker(procNum int) {
 	}
 
 	doWork := func(task ExecVersionView) {
-		pe.activeWorkers.Add(1)
-
 		execOne(task)
-		pe.activeWorkers.Add(-1)
 	}
 
 	if procNum < pe.numSpeculativeProcs {
@@ -518,8 +515,6 @@ func (pe *OpcodeLevelExecutor) SpawnReplacementWorker() {
 
 // doReplacementWork executes a single task from a replacement worker.
 func (pe *OpcodeLevelExecutor) doReplacementWork(task ExecVersionView) {
-	pe.activeWorkers.Add(1)
-
 	txIdx := task.ver.TxnIndex
 
 	res := task.Execute()
@@ -531,8 +526,6 @@ func (pe *OpcodeLevelExecutor) doReplacementWork(task ExecVersionView) {
 	pe.mvh.NotifyCompletion(txIdx)
 	pe.resultQueue.Push(txIdx, res)
 	pe.chResults <- struct{}{}
-
-	pe.activeWorkers.Add(-1)
 }
 
 type PropertyCheckOL func(*OpcodeLevelExecutor) error

@@ -73,8 +73,8 @@ func (p *ConflictPredictor) Record(msgTo common.Address, conflictKey Key) {
 // Predict returns the set of keys that historically conflicted when
 // a transaction targets msgTo. Returns nil if no predictions available.
 func (p *ConflictPredictor) Predict(msgTo common.Address) []Key {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
 
 	// Check cache first
 	if p.predCache != nil {
