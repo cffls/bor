@@ -175,9 +175,6 @@ func (pe *OpcodeLevelExecutor) Prepare() error {
 				if pe.execTasks.addDependencies(txIdxs[i-1], txIdxs[i]) {
 					pe.execTasks.clearPending(txIdxs[i])
 				}
-				// Chain ordering guarantees correct execution order.
-				// Skip validation to save ~35 MVHashMap reads per chain tx.
-				pe.skipCheck[txIdxs[i]] = true
 			}
 		}
 	}
