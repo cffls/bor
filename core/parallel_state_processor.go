@@ -412,8 +412,9 @@ func (p *ParallelStateProcessor) Process(block *types.Block, statedb *state.Stat
 				addrs = append(addrs, *tx.To())
 			}
 
-			from, _ := types.Sender(signer, tx)
-			addrs = append(addrs, from)
+			if from, err := types.Sender(signer, tx); err == nil {
+				addrs = append(addrs, from)
+			}
 		}
 
 		state.PreWarmReader(cachingReader, addrs)
