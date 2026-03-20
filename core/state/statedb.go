@@ -48,6 +48,12 @@ import (
 // TriesInMemory represents the number of layers that are kept in RAM.
 const TriesInMemory = 128
 
+var (
+	copyForExecTimer     = metrics.NewRegisteredTimer("statedb/copy_for_exec", nil)
+	copyForExecTrieTimer = metrics.NewRegisteredTimer("statedb/copy_for_exec/trie", nil)
+	settleApplyTimer     = metrics.NewRegisteredTimer("statedb/settle/apply_writeset", nil)
+)
+
 type mutationType int
 
 const (
@@ -107,15 +113,15 @@ type StateDB struct {
 	mutations map[common.Address]*mutation
 
 	// Block-stm related fields
-	mvHashmap    *blockstm.MVHashMap
-	incarnation  int
-	readList     []blockstm.ReadDescriptor    // append-only read set, returned directly by MVReadList
-	writeList    []blockstm.WriteDescriptor   // append-only write set
-	writeIndex   map[uint64]uint32            // cheap hash of Key → index in writeList
-	writeAddrs       map[common.Address]struct{}  // fast filter: addresses touched by writes
-	revertedKeys     map[blockstm.Key]struct{}
-	mvStorageCopied  map[common.Address]struct{} // tracks deep-copied objects from storage-only ops (no ADDR write)
-	dep          int
+	mvHashmap       *blockstm.MVHashMap
+	incarnation     int
+	readList        []blockstm.ReadDescriptor   // append-only read set, returned directly by MVReadList
+	writeList       []blockstm.WriteDescriptor  // append-only write set
+	writeIndex      map[uint64]uint32           // cheap hash of Key → index in writeList
+	writeAddrs      map[common.Address]struct{} // fast filter: addresses touched by writes
+	revertedKeys    map[blockstm.Key]struct{}
+	mvStorageCopied map[common.Address]struct{} // tracks deep-copied objects from storage-only ops (no ADDR write)
+	dep             int
 
 	// Goroutine suspension support (opcode-level BlockSTM).
 	// When opcodeLevel is true, MVRead blocks on a channel instead of panicking,
@@ -237,7 +243,6 @@ func (s *StateDB) SetMVHashmap(mvhm *blockstm.MVHashMap) {
 func (s *StateDB) GetMVHashmap() *blockstm.MVHashMap {
 	return s.mvHashmap
 }
-
 
 func (s *StateDB) MVWriteList() []blockstm.WriteDescriptor {
 	if len(s.revertedKeys) == 0 {
@@ -531,6 +536,7 @@ func (s *StateDB) FlushMVWriteSet() {
 // ApplyMVWriteSet applies entries in a given write set to StateDB. Note that this function does not change MVHashMap nor write set
 // of the current StateDB.
 func (s *StateDB) ApplyMVWriteSet(writes []blockstm.WriteDescriptor) {
+	defer settleApplyTimer.UpdateSince(time.Now())
 	// Cache stateObject lookups per address to avoid repeated getOrNewStateObject
 	// calls for the same address across multiple storage writes.
 	type objPair struct {
@@ -1440,6 +1446,7 @@ func (s *StateDB) SetReader(r Reader) {
 // execution. It assumes the source is a clean base state (no logs, no preimages,
 // empty access list/transient storage/journal) and skips unnecessary allocations.
 func (s *StateDB) CopyForExecution() *StateDB {
+	defer copyForExecTimer.UpdateSince(time.Now())
 	state := &StateDB{
 		db:           s.db,
 		reader:       s.reader,
@@ -1462,7 +1469,9 @@ func (s *StateDB) CopyForExecution() *StateDB {
 		writeAddrs: make(map[common.Address]struct{}, 8),
 	}
 	if s.trie != nil {
+		trieStart := time.Now()
 		state.trie = mustCopyTrie(s.trie)
+		copyForExecTrieTimer.UpdateSince(trieStart)
 	}
 
 	// Share state objects as read-only references (not deep copies).

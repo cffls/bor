@@ -40,7 +40,7 @@ type ParallelEVMConfig struct {
 	Enable               bool
 	SpeculativeProcesses int
 	Enforce              bool
-	OpcodeLevel    bool // Enable opcode-level BlockSTM (goroutine suspension on dependency)
+	OpcodeLevel          bool // Enable opcode-level BlockSTM (goroutine suspension on dependency)
 }
 
 // StateProcessor is a basic Processor, which takes care of transitioning
@@ -88,11 +88,11 @@ type ExecutionTask struct {
 	// first 2 element in dependencies -> transaction index, and flag representing if delay is allowed or not
 	//                                       (0 -> delay is not allowed, 1 -> delay is allowed)
 	// next k elements in dependencies -> transaction indexes on which transaction i is dependent on
-	dependencies      []int
-	coinbase          common.Address
-	blockContext      vm.BlockContext
-	jumpDests         vm.JumpDestCache
-	opcodeLevel bool // enable goroutine suspension in MVRead
+	dependencies []int
+	coinbase     common.Address
+	blockContext vm.BlockContext
+	jumpDests    vm.JumpDestCache
+	opcodeLevel  bool // enable goroutine suspension in MVRead
 }
 
 func (task *ExecutionTask) Execute(mvh *blockstm.MVHashMap, incarnation int) (err error) {
@@ -184,7 +184,6 @@ func (task *ExecutionTask) Dependencies() []int {
 	return task.dependencies
 }
 
-
 func (task *ExecutionTask) Settle() {
 	// Disable MVHashMap during settlement so Get*/Set* calls bypass MVRead/MVWrite.
 	// This is safe because finalStateDB is exclusively owned by the settlement
@@ -275,7 +274,13 @@ func (task *ExecutionTask) Settle() {
 	*task.allLogs = append(*task.allLogs, receipt.Logs...)
 }
 
-var parallelizabilityTimer = metrics.NewRegisteredTimer("block/parallelizability", nil)
+var (
+	parallelizabilityTimer       = metrics.NewRegisteredTimer("block/parallelizability", nil)
+	parallelTaskSetupTimer       = metrics.NewRegisteredTimer("blockstm/parallel/task_setup", nil)
+	parallelExecutePhaseTimer    = metrics.NewRegisteredTimer("blockstm/parallel/execute_phase", nil)
+	parallelSettlementPhaseTimer = metrics.NewRegisteredTimer("blockstm/parallel/settlement_phase", nil)
+	parallelCopyForExecTimer     = metrics.NewRegisteredTimer("blockstm/parallel/copy_for_exec", nil)
+)
 
 // chainConfig returns the chain configuration.
 func (p *ParallelStateProcessor) chainConfig() *params.ChainConfig {
@@ -397,6 +402,8 @@ func (p *ParallelStateProcessor) Process(block *types.Block, statedb *state.Stat
 	// For opcode-level mode, all tasks share the same base statedb reference.
 	// Each Execute() call does Copy() before running, so per-task copies here
 	// are redundant and eliminated to reduce setup overhead.
+	taskSetupStart := time.Now()
+
 	var sharedCleanStateDB *state.StateDB
 	if p.bc.opcodeLevel {
 		sharedCleanStateDB = statedb.Copy()
@@ -464,11 +471,13 @@ func (p *ParallelStateProcessor) Process(block *types.Block, statedb *state.Stat
 			coinbase:          coinbase,
 			blockContext:      blockContext,
 			jumpDests:         sharedJumpDests,
-			opcodeLevel: p.bc.opcodeLevel,
+			opcodeLevel:       p.bc.opcodeLevel,
 		}
 
 		tasks = append(tasks, task)
 	}
+
+	parallelTaskSetupTimer.UpdateSince(taskSetupStart)
 
 	// Lazy backup: for opcode-level mode, defer the expensive statedb.Copy()
 	// until a fee-delay rerun is actually needed (rare path).
@@ -481,6 +490,8 @@ func (p *ParallelStateProcessor) Process(block *types.Block, statedb *state.Stat
 	profile := false
 
 	var result blockstm.ParallelExecutionResult
+
+	executeStart := time.Now()
 
 	if p.bc.opcodeLevel {
 		// Build predictions from conflict predictor
@@ -503,6 +514,8 @@ func (p *ParallelStateProcessor) Process(block *types.Block, statedb *state.Stat
 	} else {
 		result, err = blockstm.ExecuteParallel(tasks, profile, metadata, p.bc.parallelSpeculativeProcesses, interruptCtx)
 	}
+
+	parallelExecutePhaseTimer.UpdateSince(executeStart)
 
 	// Feed conflict predictor with data from this block's execution.
 	// Record the full Key (not just address) so predictions target exact

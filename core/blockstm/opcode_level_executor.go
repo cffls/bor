@@ -38,7 +38,7 @@ type OpcodeLevelExecutor struct {
 	// Channels for task dispatch — same pattern as baseline executor
 	chTasks            chan ExecVersionView // guaranteed (next-in-order) tasks
 	chSpeculativeTasks chan struct{}        // signal for speculative tasks
-	specTaskQueue      SafeQueue           // priority queue of speculative tasks
+	specTaskQueue      SafeQueue            // priority queue of speculative tasks
 
 	chSettle chan int
 	settleWg sync.WaitGroup
@@ -81,7 +81,21 @@ type OpcodeLevelExecutor struct {
 	profile bool
 }
 
-var opcodeLevelSettleWaitTimer = metrics.NewRegisteredTimer("blockstm/opcode-level/settle/wait", nil)
+var (
+	opcodeLevelSettleWaitTimer     = metrics.NewRegisteredTimer("blockstm/opcode-level/settle/wait", nil)
+	opcodeLevelSchedulerIdleTimer  = metrics.NewRegisteredTimer("blockstm/opcode-level/scheduler/idle", nil)
+	opcodeLevelSchedulerStepTimer  = metrics.NewRegisteredTimer("blockstm/opcode-level/scheduler/step", nil)
+	opcodeLevelValidationTimer     = metrics.NewRegisteredTimer("blockstm/opcode-level/validation", nil)
+	opcodeLevelWorkerExecTimer     = metrics.NewRegisteredTimer("blockstm/opcode-level/worker/exec", nil)
+	opcodeLevelWorkerFlushTimer    = metrics.NewRegisteredTimer("blockstm/opcode-level/worker/flush", nil)
+	opcodeLevelPrepareTimer        = metrics.NewRegisteredTimer("blockstm/opcode-level/prepare", nil)
+	opcodeLevelAbortCounter        = metrics.NewRegisteredCounter("blockstm/opcode-level/aborts", nil)
+	opcodeLevelSuspensionCounter   = metrics.NewRegisteredCounter("blockstm/opcode-level/suspensions", nil)
+	opcodeLevelReplacementCounter  = metrics.NewRegisteredCounter("blockstm/opcode-level/replacements", nil)
+	opcodeLevelValidationFailCount = metrics.NewRegisteredCounter("blockstm/opcode-level/validation/fail", nil)
+	opcodeLevelExecCount           = metrics.NewRegisteredCounter("blockstm/opcode-level/exec/count", nil)
+	opcodeLevelTxCount             = metrics.NewRegisteredCounter("blockstm/opcode-level/tx/count", nil)
+)
 
 const numGoProcsOL = 1
 
@@ -122,6 +136,7 @@ func NewOpcodeLevelExecutor(tasks []ExecTask, profile bool, numProcs int) *Opcod
 // Same-sender ordering is preserved to avoid nonce retry storms.
 // Cross-sender conflicts are handled by goroutine suspension in MVRead.
 func (pe *OpcodeLevelExecutor) Prepare() error {
+	defer opcodeLevelPrepareTimer.UpdateSince(time.Now())
 	// Same-sender dependency tracking — identical to baseline executor
 	prevSenderTx := make(map[common.Address]int)
 
@@ -223,11 +238,16 @@ func (pe *OpcodeLevelExecutor) worker(procNum int) {
 			start = time.Since(pe.begin)
 		}
 
+		execStart := time.Now()
 		res := task.Execute()
+		opcodeLevelWorkerExecTimer.UpdateSince(execStart)
+
 		txIdx := task.ver.TxnIndex
 
 		if res.err == nil {
+			flushStart := time.Now()
 			pe.mvh.FlushMVWriteSet(res.txAllOut)
+			opcodeLevelWorkerFlushTimer.UpdateSince(flushStart)
 		}
 
 		pe.mvh.NotifyCompletion(txIdx)
@@ -404,6 +424,8 @@ func (pe *OpcodeLevelExecutor) Step(res *ExecResult) (result ParallelExecutionRe
 		toValidate = append(toValidate, pe.validateTasks.takeNextPending())
 	}
 
+	validationStart := time.Now()
+
 	for i := 0; i < len(toValidate); i++ {
 		pe.cntTotalValidations++
 
@@ -430,6 +452,10 @@ func (pe *OpcodeLevelExecutor) Step(res *ExecResult) (result ParallelExecutionRe
 			pe.txIncarnations[tx]++
 			pe.mvh.ResetCompletion(tx)
 		}
+	}
+
+	if len(toValidate) > 0 {
+		opcodeLevelValidationTimer.UpdateSince(validationStart)
 	}
 
 	// Settlement
@@ -544,7 +570,11 @@ func executeOpcodeLevelWithCheck(tasks []ExecTask, profile bool, numProcs int, p
 		return
 	}
 
+	idleStart := time.Now()
+
 	for range pe.chResults {
+		opcodeLevelSchedulerIdleTimer.UpdateSince(idleStart)
+
 		if interruptCtx != nil && interruptCtx.Err() != nil {
 			pe.Close(true)
 			return result, interruptCtx.Err()
@@ -552,15 +582,25 @@ func executeOpcodeLevelWithCheck(tasks []ExecTask, profile bool, numProcs int, p
 
 		res := pe.resultQueue.Pop().(ExecResult)
 
+		stepStart := time.Now()
 		result, err = pe.Step(&res)
+		opcodeLevelSchedulerStepTimer.UpdateSince(stepStart)
 
 		if err != nil {
 			return result, err
 		}
 
 		if result.TxIO != nil || err != nil {
+			opcodeLevelAbortCounter.Inc(int64(pe.cntAbort))
+			opcodeLevelSuspensionCounter.Inc(pe.cntSuspensions.Load())
+			opcodeLevelReplacementCounter.Inc(pe.cntReplacements.Load())
+			opcodeLevelValidationFailCount.Inc(int64(pe.cntValidationFail))
+			opcodeLevelExecCount.Inc(int64(pe.cntExec))
+			opcodeLevelTxCount.Inc(int64(len(tasks)))
 			return result, err
 		}
+
+		idleStart = time.Now()
 	}
 
 	return
