@@ -3,7 +3,6 @@ package blockstm
 import (
 	"context"
 	"fmt"
-	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -172,34 +171,16 @@ func (pe *OpcodeLevelExecutor) Prepare() error {
 		}
 	}
 
-	// Chain-style dispatch dependencies from predictions.
-	// For each predicted conflict key, sort txs and chain each to its
-	// immediate predecessor. This pipelines conflicting txs correctly:
-	// tx N starts right after N-1 finishes, executes once without VFail.
-	// Independent chains and non-predicted txs run fully in parallel.
-	if pe.predictions != nil {
-		keyTxs := make(map[Key][]int)
-
-		for txIdx, keys := range pe.predictions {
-			for _, k := range keys {
-				keyTxs[k] = append(keyTxs[k], txIdx)
-			}
-		}
-
-		for _, txIdxs := range keyTxs {
-			if len(txIdxs) < 2 {
-				continue
-			}
-
-			sort.Ints(txIdxs)
-
-			for i := 1; i < len(txIdxs); i++ {
-				if pe.execTasks.addDependencies(txIdxs[i-1], txIdxs[i]) {
-					pe.execTasks.clearPending(txIdxs[i])
-				}
-			}
-		}
-	}
+	// NOTE: Conflict predictions are currently disabled for opcode-level mode.
+	// The previous implementation used addDependencies/clearPending which
+	// serialized txs via hard scheduler dependencies (depth=100 chains).
+	// An alternative approach using WriteEstimate pre-population has false-
+	// positive cleanup issues that cause hangs. For now, opcode-level
+	// suspension handles conflicts dynamically without predictions.
+	//
+	// TODO: Implement prediction via WriteEstimate with proper false-positive
+	// cleanup (requires tracking predicted vs actual writes per tx and
+	// cleaning up stale FlagEstimate entries after execution).
 
 	// Compute dependency chain depth: the longest chain of same-sender
 	// (or prediction-based) dependencies. This bounds the minimum serial
@@ -298,7 +279,11 @@ func (pe *OpcodeLevelExecutor) worker(procNum int) {
 		if res.err == nil {
 			flushStart := time.Now()
 			pe.mvh.FlushMVWriteSet(res.txAllOut)
+			pe.mvh.CleanupPredictions(txIdx, res.txAllOut)
 			opcodeLevelWorkerFlushTimer.UpdateSince(flushStart)
+		} else {
+			// On error/abort, clean up all predicted estimates (no actual writes)
+			pe.mvh.CleanupPredictions(txIdx, nil)
 		}
 
 		pe.mvh.NotifyCompletion(txIdx)
@@ -598,6 +583,9 @@ func (pe *OpcodeLevelExecutor) doReplacementWork(task ExecVersionView) {
 
 	if res.err == nil {
 		pe.mvh.FlushMVWriteSet(res.txAllOut)
+		pe.mvh.CleanupPredictions(txIdx, res.txAllOut)
+	} else {
+		pe.mvh.CleanupPredictions(txIdx, nil)
 	}
 
 	pe.mvh.NotifyCompletion(txIdx)

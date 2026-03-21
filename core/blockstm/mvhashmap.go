@@ -19,9 +19,9 @@ import (
 //   - 1000 unique keys: ~0.07%
 //   - 5000 unique keys: ~5%
 const (
-	bloomBits  = 1 << 15             // 32768 bits
-	bloomWords = bloomBits / 64      // 512 uint64s = 4KB
-	bloomMask  = bloomBits - 1       // bitmask for modulo
+	bloomBits  = 1 << 15        // 32768 bits
+	bloomWords = bloomBits / 64 // 512 uint64s = 4KB
+	bloomMask  = bloomBits - 1  // bitmask for modulo
 )
 
 type writeBloom struct {
@@ -159,6 +159,10 @@ type MVHashMap struct {
 	// Called when a worker is about to block in MVRead, so a replacement
 	// can be spawned to prevent worker pool exhaustion.
 	onWorkerSuspend func()
+
+	// Predicted keys per tx for false-positive cleanup after execution.
+	// Set by conflict predictor; used by CleanupPredictions.
+	predictedKeys map[int][]Key
 }
 
 // closedSentinel is a pre-closed channel reused as the "completed" marker in
@@ -425,6 +429,27 @@ func (mv *MVHashMap) Delete(k Key, txIdx int) {
 	}
 }
 
+// TryDelete removes the entry for txIdx if the key exists.
+// Unlike Delete, it does not panic if the key is absent.
+func (mv *MVHashMap) TryDelete(k Key, txIdx int) {
+	cells := mv.getKeyCells(k, func(_ Key) *TxnIndexCells {
+		return nil
+	})
+	if cells == nil {
+		return
+	}
+
+	cells.rw.Lock()
+	defer cells.rw.Unlock()
+
+	if pos, found := cells.find(txIdx); found {
+		// Only delete if it's still a FlagEstimate (not overwritten by real Write)
+		if cells.entries[pos].cell.flag == FlagEstimate {
+			cells.entries = append(cells.entries[:pos], cells.entries[pos+1:]...)
+		}
+	}
+}
+
 const (
 	MVReadResultDone       = 0
 	MVReadResultDependency = 1
@@ -508,6 +533,36 @@ func (mv *MVHashMap) Read(k Key, txIdx int) (res MVReadResult) {
 func (mv *MVHashMap) FlushMVWriteSet(writes []WriteDescriptor) {
 	for _, v := range writes {
 		mv.Write(v.Path, v.V, v.Val)
+	}
+}
+
+// SetPredictedKeys records the predicted conflict keys per tx so that
+// false-positive FlagEstimate entries can be cleaned up after execution.
+func (mv *MVHashMap) SetPredictedKeys(predictions map[int][]Key) {
+	mv.predictedKeys = predictions
+}
+
+// CleanupPredictions removes FlagEstimate entries for a completed tx
+// that were inserted by the conflict predictor but never overwritten by
+// an actual Write (false positives). This prevents infinite re-read loops
+// in opcode-level suspension mode.
+func (mv *MVHashMap) CleanupPredictions(txIdx int, actualWrites []WriteDescriptor) {
+	predicted, ok := mv.predictedKeys[txIdx]
+	if !ok || len(predicted) == 0 {
+		return
+	}
+
+	// Build set of actually-written keys for O(1) lookup
+	written := make(map[Key]struct{}, len(actualWrites))
+	for _, w := range actualWrites {
+		written[w.Path] = struct{}{}
+	}
+
+	// Delete FlagEstimate entries that weren't overwritten
+	for _, k := range predicted {
+		if _, wasWritten := written[k]; !wasWritten {
+			mv.TryDelete(k, txIdx)
+		}
 	}
 }
 
