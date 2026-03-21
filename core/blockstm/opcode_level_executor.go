@@ -95,6 +95,13 @@ var (
 	opcodeLevelValidationFailCount = metrics.NewRegisteredCounter("blockstm/opcode-level/validation/fail", nil)
 	opcodeLevelExecCount           = metrics.NewRegisteredCounter("blockstm/opcode-level/exec/count", nil)
 	opcodeLevelTxCount             = metrics.NewRegisteredCounter("blockstm/opcode-level/tx/count", nil)
+
+	// Parallelism metrics — measure actual concurrency achieved
+	opcodeLevelActiveWorkersHist   = metrics.NewRegisteredHistogram("blockstm/opcode-level/active_workers", nil, metrics.NewUniformSample(10240))
+	opcodeLevelDepChainDepthHist   = metrics.NewRegisteredHistogram("blockstm/opcode-level/dep_chain_depth", nil, metrics.NewUniformSample(10240))
+	opcodeLevelBlockedTasksHist    = metrics.NewRegisteredHistogram("blockstm/opcode-level/blocked_tasks", nil, metrics.NewUniformSample(10240))
+	opcodeLevelPendingTasksHist    = metrics.NewRegisteredHistogram("blockstm/opcode-level/pending_tasks", nil, metrics.NewUniformSample(10240))
+	opcodeLevelInProgressTasksHist = metrics.NewRegisteredHistogram("blockstm/opcode-level/in_progress_tasks", nil, metrics.NewUniformSample(10240))
 )
 
 const numGoProcsOL = 1
@@ -194,6 +201,42 @@ func (pe *OpcodeLevelExecutor) Prepare() error {
 		}
 	}
 
+	// Compute dependency chain depth: the longest chain of same-sender
+	// (or prediction-based) dependencies. This bounds the minimum serial
+	// execution path — parallelism can't help beyond this.
+	// Iteration order 0..N-1 is valid because addDependencies enforces
+	// blocker < dependent, so depth[blocker] is always computed first.
+	{
+		numTx := len(pe.tasks)
+		depth := make([]int, numTx)
+		maxDepth := 0
+		blockedCount := 0
+
+		for i := 0; i < numTx; i++ {
+			depth[i] = 1
+			if pe.execTasks.isBlocked(i) {
+				blockedCount++
+			}
+
+			// Propagate depth to all dependents of tx i
+			if dependents, ok := pe.execTasks.dependency[i]; ok {
+				for dep := range dependents {
+					if depth[i]+1 > depth[dep] {
+						depth[dep] = depth[i] + 1
+					}
+				}
+			}
+
+			if depth[i] > maxDepth {
+				maxDepth = depth[i]
+			}
+		}
+
+		opcodeLevelDepChainDepthHist.Update(int64(maxDepth))
+		opcodeLevelBlockedTasksHist.Update(int64(blockedCount))
+		opcodeLevelPendingTasksHist.Update(int64(len(pe.execTasks.pending)))
+	}
+
 	pe.mvh.SetOnWorkerSuspend(func() {
 		pe.cntSuspensions.Add(1)
 		pe.SpawnReplacementWorker()
@@ -238,9 +281,13 @@ func (pe *OpcodeLevelExecutor) worker(procNum int) {
 			start = time.Since(pe.begin)
 		}
 
+		pe.activeWorkers.Add(1)
+
 		execStart := time.Now()
 		res := task.Execute()
 		opcodeLevelWorkerExecTimer.UpdateSince(execStart)
+
+		pe.activeWorkers.Add(-1)
 
 		txIdx := task.ver.TxnIndex
 
@@ -574,6 +621,10 @@ func executeOpcodeLevelWithCheck(tasks []ExecTask, profile bool, numProcs int, p
 
 	for range pe.chResults {
 		opcodeLevelSchedulerIdleTimer.UpdateSince(idleStart)
+
+		// Sample concurrency: how many workers are actively executing right now
+		opcodeLevelActiveWorkersHist.Update(int64(pe.activeWorkers.Load()))
+		opcodeLevelInProgressTasksHist.Update(int64(len(pe.execTasks.inProgress)))
 
 		if interruptCtx != nil && interruptCtx.Err() != nil {
 			pe.Close(true)
