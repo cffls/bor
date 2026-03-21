@@ -212,8 +212,12 @@ func (pe *OpcodeLevelExecutor) Prepare() error {
 		maxDepth := 0
 		blockedCount := 0
 
+		// Initialize all depths to 1 (no dependencies = depth 1)
 		for i := 0; i < numTx; i++ {
 			depth[i] = 1
+		}
+
+		for i := 0; i < numTx; i++ {
 			if pe.execTasks.isBlocked(i) {
 				blockedCount++
 			}
