@@ -172,15 +172,19 @@ func (pe *OpcodeLevelExecutor) Prepare() error {
 	}
 
 	// NOTE: Conflict predictions are currently disabled for opcode-level mode.
-	// The previous implementation used addDependencies/clearPending which
-	// serialized txs via hard scheduler dependencies (depth=100 chains).
-	// An alternative approach using WriteEstimate pre-population has false-
-	// positive cleanup issues that cause hangs. For now, opcode-level
-	// suspension handles conflicts dynamically without predictions.
+	// Conflict predictions are disabled for opcode-level mode.
 	//
-	// TODO: Implement prediction via WriteEstimate with proper false-positive
-	// cleanup (requires tracking predicted vs actual writes per tx and
-	// cleaning up stale FlagEstimate entries after execution).
+	// Predictions via WriteEstimate pre-population cause deadlocks:
+	// when a validation failure triggers MarkEstimate + ResetCompletion,
+	// workers suspend on the re-execution's FlagEstimate entries. If the
+	// guaranteed worker is suspended, its replacement spawns but exits
+	// immediately (non-blocking select), leaving no one to process the
+	// re-execution from chTasks. Making replacements block on chTasks
+	// causes them to steal guaranteed tasks from regular workers.
+	//
+	// Opcode-level suspension handles conflicts dynamically without
+	// predictions. The ~10 VFails/block (~16ms overhead) is the cost
+	// of speculative execution without predictions.
 
 	// Compute dependency chain depth: the longest chain of same-sender
 	// (or prediction-based) dependencies. This bounds the minimum serial
