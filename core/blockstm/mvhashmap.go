@@ -7,7 +7,6 @@ import (
 	"sync/atomic"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/holiman/uint256"
 )
 
 // writeBloom is a lock-free bloom filter that tracks which keys have been
@@ -71,7 +70,6 @@ func atomicSetBit(word *uint64, bit uint) {
 
 const FlagDone = 0
 const FlagEstimate = 1
-const FlagDelta = 2
 
 const addressType = 1
 const stateType = 2
@@ -270,8 +268,6 @@ type WriteCell struct {
 	flag        uint
 	incarnation int
 	data        interface{}
-	deltaAdd    uint256.Int
-	deltaSub    uint256.Int
 }
 
 type txnEntry struct {
@@ -406,13 +402,6 @@ func (mv *MVHashMap) WriteEstimate(k Key, v Version) {
 }
 
 func (mv *MVHashMap) MarkEstimate(k Key, txIdx int) {
-	// Skip balance delta entries — they're commutative and the re-executed
-	// tx's WriteDelta replaces them atomically. Converting to FlagEstimate
-	// would cause cascading ReadDelta aborts for every balance reader.
-	if k.IsSubpath() && k.GetSubpath() == SubpathBalance {
-		return
-	}
-
 	cells := mv.getKeyCells(k, func(_ Key) *TxnIndexCells {
 		panic(fmt.Errorf("path must already exist"))
 	})
@@ -432,10 +421,6 @@ func (mv *MVHashMap) MarkEstimate(k Key, txIdx int) {
 
 // Delete removes the entry for txIdx.
 func (mv *MVHashMap) Delete(k Key, txIdx int) {
-	if k.IsSubpath() && k.GetSubpath() == SubpathBalance {
-		return
-	}
-
 	cells := mv.getKeyCells(k, func(_ Key) *TxnIndexCells {
 		panic(fmt.Errorf("path must already exist"))
 	})
@@ -473,7 +458,6 @@ const (
 	MVReadResultDone       = 0
 	MVReadResultDependency = 1
 	MVReadResultNone       = 2
-	MVReadResultDelta      = 3
 )
 
 type MVReadResult struct {
@@ -540,8 +524,6 @@ func (mv *MVHashMap) Read(k Key, txIdx int) (res MVReadResult) {
 			res.depIdx = entry.index
 			res.incarnation = c.incarnation
 			res.value = c.data
-		case FlagDelta:
-			res.depIdx = entry.index
 		default:
 			panic(fmt.Errorf("should not happen - unknown flag value"))
 		}
@@ -552,123 +534,8 @@ func (mv *MVHashMap) Read(k Key, txIdx int) (res MVReadResult) {
 	return
 }
 
-type DeltaReadResult struct {
-	Status  int
-	DepIdx  int
-	Add     uint256.Int
-	Sub     uint256.Int
-	Version int
-}
-
-func (mv *MVHashMap) WriteDelta(k Key, v Version, add *uint256.Int, sub *uint256.Int) {
-	mv.bloom.add(k)
-	cells := mv.getKeyCells(k, func(kenc Key) (cells *TxnIndexCells) {
-		shard := mv.getShard(kenc)
-		shard.mu.Lock()
-		cells, ok := shard.m[kenc]
-		if !ok {
-			cells = &TxnIndexCells{}
-			shard.m[kenc] = cells
-		}
-		shard.mu.Unlock()
-		return
-	})
-	cells.rw.Lock()
-	if pos, found := cells.find(v.TxnIndex); !found {
-		entry := txnEntry{index: v.TxnIndex, cell: &WriteCell{flag: FlagDelta, incarnation: v.Incarnation}}
-		if add != nil {
-			entry.cell.deltaAdd.Set(add)
-		}
-		if sub != nil {
-			entry.cell.deltaSub.Set(sub)
-		}
-		cells.entries = append(cells.entries, txnEntry{})
-		copy(cells.entries[pos+1:], cells.entries[pos:])
-		cells.entries[pos] = entry
-	} else {
-		ci := cells.entries[pos].cell
-		if ci.incarnation < v.Incarnation {
-			ci.flag = FlagDelta
-			ci.incarnation = v.Incarnation
-			ci.deltaAdd.Clear()
-			ci.deltaSub.Clear()
-			if add != nil {
-				ci.deltaAdd.Set(add)
-			}
-			if sub != nil {
-				ci.deltaSub.Set(sub)
-			}
-		} else {
-			ci.flag = FlagDelta
-			if add != nil {
-				ci.deltaAdd.Add(&ci.deltaAdd, add)
-			}
-			if sub != nil {
-				ci.deltaSub.Add(&ci.deltaSub, sub)
-			}
-		}
-	}
-	cells.rw.Unlock()
-}
-
-func (mv *MVHashMap) ReadDelta(k Key, txIdx int) DeltaReadResult {
-	if !mv.bloom.mayContain(k) {
-		return DeltaReadResult{Status: MVReadResultNone}
-	}
-	cells := mv.getKeyCells(k, func(_ Key) *TxnIndexCells { return nil })
-	if cells == nil {
-		return DeltaReadResult{Status: MVReadResultNone}
-	}
-	cells.rw.RLock()
-	defer cells.rw.RUnlock()
-	var totalAdd, totalSub uint256.Int
-	for i := range cells.entries {
-		entry := &cells.entries[i]
-		if entry.index >= txIdx {
-			break
-		}
-		switch entry.cell.flag {
-		case FlagDelta, FlagEstimate:
-			// FlagEstimate entries retain stale delta values from the prior incarnation.
-			// For commutative balance tracking we use them speculatively; validation
-			// is skipped for delta reads (TxnIndex == -2) so the caller accepts
-			// approximate values. Settlement always uses pair.src.Balance() (absolute).
-			totalAdd.Add(&totalAdd, &entry.cell.deltaAdd)
-			totalSub.Add(&totalSub, &entry.cell.deltaSub)
-		case FlagDone:
-			return DeltaReadResult{Status: MVReadResultDone, DepIdx: entry.index}
-		}
-	}
-	if totalAdd.IsZero() && totalSub.IsZero() {
-		return DeltaReadResult{Status: MVReadResultNone}
-	}
-	version := int(totalAdd.Uint64()>>1 ^ totalSub.Uint64()>>1)
-	return DeltaReadResult{Status: MVReadResultDelta, Add: totalAdd, Sub: totalSub, Version: version}
-}
-
-func (mv *MVHashMap) GetTxDelta(k Key, txIdx int) (add uint256.Int, sub uint256.Int, found bool) {
-	cells := mv.getKeyCells(k, func(_ Key) *TxnIndexCells { return nil })
-	if cells == nil {
-		return
-	}
-	cells.rw.RLock()
-	defer cells.rw.RUnlock()
-	if pos, ok := cells.find(txIdx); ok {
-		c := cells.entries[pos].cell
-		if c.flag == FlagDelta {
-			add.Set(&c.deltaAdd)
-			sub.Set(&c.deltaSub)
-			found = true
-		}
-	}
-	return
-}
-
 func (mv *MVHashMap) FlushMVWriteSet(writes []WriteDescriptor) {
 	for _, v := range writes {
-		if v.Path.IsSubpath() && v.Path.GetSubpath() == SubpathBalance {
-			continue
-		}
 		mv.Write(v.Path, v.V, v.Val)
 	}
 }
@@ -714,7 +581,7 @@ func ValidateVersion(txIdx int, lastInputOutput *TxnInputOutput, versionedData *
 			continue
 		}
 
-		if rd.V.TxnIndex == -2 {
+		if rd.Path.IsSubpath() && rd.Path.GetSubpath() == SubpathBalance {
 			continue
 		}
 
