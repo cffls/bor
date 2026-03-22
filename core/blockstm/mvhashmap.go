@@ -406,12 +406,10 @@ func (mv *MVHashMap) WriteEstimate(k Key, v Version) {
 }
 
 func (mv *MVHashMap) MarkEstimate(k Key, txIdx int) {
-	// Skip balance delta entries — they're commutative and the re-executed
-	// tx's WriteDelta replaces them atomically. Converting to FlagEstimate
-	// would cause cascading ReadDelta aborts for every balance reader.
-	if k.IsSubpath() && k.GetSubpath() == SubpathBalance {
-		return
-	}
+	// Balance delta entries: MarkEstimate converts FlagDelta to FlagEstimate,
+	// causing ReadDelta to return MVReadResultDependency. This makes readers
+	// wait for the re-execution to complete. The entry already exists from
+	// WriteDelta, so the getKeyCells panic won't trigger.
 
 	cells := mv.getKeyCells(k, func(_ Key) *TxnIndexCells {
 		panic(fmt.Errorf("path must already exist"))
@@ -432,9 +430,6 @@ func (mv *MVHashMap) MarkEstimate(k Key, txIdx int) {
 
 // Delete removes the entry for txIdx.
 func (mv *MVHashMap) Delete(k Key, txIdx int) {
-	if k.IsSubpath() && k.GetSubpath() == SubpathBalance {
-		return
-	}
 
 	cells := mv.getKeyCells(k, func(_ Key) *TxnIndexCells {
 		panic(fmt.Errorf("path must already exist"))
