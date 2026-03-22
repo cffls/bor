@@ -201,10 +201,101 @@ func (task *ExecutionTask) Settle() {
 	// read it during a goroutine suspension with partially accumulated deltas.
 	senderInitBalance := task.finalStateDB.GetBalance(task.msg.From)
 
+	// Snapshot pre-tx balances for transfer log replay (before ApplyMVWriteSet).
+	records := task.statedb.GetTransferRecords()
+	preTxBalances := make(map[common.Address]*big.Int, len(records)*2+1)
+	if len(records) > 0 {
+		// Always capture the tx sender's pre-tx balance (needed for gas purchase).
+		preTxBalances[task.msg.From] = task.finalStateDB.GetBalance(task.msg.From).ToBig()
+		for _, r := range records {
+			if _, ok := preTxBalances[r.Sender]; !ok {
+				preTxBalances[r.Sender] = task.finalStateDB.GetBalance(r.Sender).ToBig()
+			}
+			if _, ok := preTxBalances[r.Recipient]; !ok {
+				preTxBalances[r.Recipient] = task.finalStateDB.GetBalance(r.Recipient).ToBig()
+			}
+		}
+	}
+
 	task.finalStateDB.ApplyMVWriteSet(task.statedb.MVWriteList())
 
-	for _, l := range task.statedb.GetLogs(task.tx.Hash(), task.blockNumber.Uint64(), task.blockHash, task.blockTime) {
-		task.finalStateDB.AddLog(l)
+	// Merge speculative logs with deferred transfer logs in correct order.
+	specLogs := task.statedb.GetLogs(task.tx.Hash(), task.blockNumber.Uint64(), task.blockHash, task.blockTime)
+
+	if len(records) == 0 {
+		// Fast path: no deferred transfers, just copy logs as before.
+		for _, l := range specLogs {
+			task.finalStateDB.AddLog(l)
+		}
+	} else {
+
+		// Forward-walk from pre-transfer balances to compute the pre/post
+		// balance snapshot at each transfer point.
+		//
+		// Balance timeline within a tx:
+		//   1. Pre-tx balance (read above from settled state)
+		//   2. buyGas: sender -= gasLimit * gasPrice (+ blobFee if applicable)
+		//   3. Transfer calls (0 or more) — the only balance changes during EVM
+		//   4. returnGas, tip, burn — after EVM execution
+		//
+		// We start from pre-tx balances, subtract gas purchase for the sender,
+		// then forward-walk through transfers.
+		balances := make(map[common.Address]*big.Int, len(preTxBalances))
+		for addr, bal := range preTxBalances {
+			balances[addr] = new(big.Int).Set(bal)
+		}
+
+		// Subtract gas purchase from sender: gasLimit * gasPrice
+		gasPurchase := new(big.Int).SetUint64(task.msg.GasLimit)
+		gasPurchase.Mul(gasPurchase, task.msg.GasPrice)
+		balances[task.msg.From] = new(big.Int).Sub(balances[task.msg.From], gasPurchase)
+
+		getBal := func(addr common.Address) *big.Int {
+			if b, ok := balances[addr]; ok {
+				return b
+			}
+			// For addresses not in transfer records, read from pre-tx state.
+			return task.finalStateDB.GetBalance(addr).ToBig()
+		}
+
+		type transferSnap struct {
+			senderPre, recipientPre, senderPost, recipientPost *big.Int
+		}
+		snaps := make([]transferSnap, len(records))
+
+		// Forward-walk through transfers, computing pre/post at each step.
+		for i := range records {
+			r := &records[i]
+			amt := r.Amount.ToBig()
+			senderPre := new(big.Int).Set(getBal(r.Sender))
+			recipientPre := new(big.Int).Set(getBal(r.Recipient))
+			senderPost := new(big.Int).Sub(senderPre, amt)
+			recipientPost := new(big.Int).Add(recipientPre, amt)
+			snaps[i] = transferSnap{senderPre, recipientPre, senderPost, recipientPost}
+			balances[r.Sender] = senderPost
+			balances[r.Recipient] = recipientPost
+		}
+
+		// Interleave speculative logs and transfer logs in the correct order.
+		// Each record has a LogIndex indicating where in the original log
+		// sequence the transfer log should appear.
+		specIdx := 0
+		for ri, r := range records {
+			// Add all speculative logs that come before this transfer log position.
+			for specIdx < len(specLogs) && uint(specIdx) < r.LogIndex {
+				task.finalStateDB.AddLog(specLogs[specIdx])
+				specIdx++
+			}
+			// Insert the transfer log at this position.
+			s := snaps[ri]
+			AddTransferLog(task.finalStateDB, r.Sender, r.Recipient,
+				r.Amount.ToBig(), s.senderPre, s.recipientPre, s.senderPost, s.recipientPost)
+		}
+		// Add any remaining speculative logs after the last transfer log.
+		for specIdx < len(specLogs) {
+			task.finalStateDB.AddLog(specLogs[specIdx])
+			specIdx++
+		}
 	}
 
 	if *task.shouldDelayFeeCal {

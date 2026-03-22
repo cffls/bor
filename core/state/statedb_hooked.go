@@ -305,6 +305,10 @@ func (s *hookedStateDB) Logs() []*types.Log {
 	return s.inner.Logs()
 }
 
+func (s *hookedStateDB) RecordTransfer(sender, recipient common.Address, amount *uint256.Int) bool {
+	return s.inner.RecordTransfer(sender, recipient, amount)
+}
+
 // Inner receives the underlying state db
 func (s *hookedStateDB) Inner() *StateDB {
 	return s.inner

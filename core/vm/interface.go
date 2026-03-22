@@ -106,6 +106,10 @@ type StateDB interface {
 	// Finalise must be invoked at the end of a transaction
 	Finalise(bool)
 
+	// RecordTransfer stores a transfer for deferred log reconstruction.
+	// Returns true if recorded (parallel mode), false if not (serial mode).
+	RecordTransfer(sender, recipient common.Address, amount *uint256.Int) bool
+
 	// Inner returns the underlying state instance. Needed for bor consensus.
 	Inner() *state.StateDB
 }

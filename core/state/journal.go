@@ -291,6 +291,9 @@ type (
 		account       common.Address
 		key, prevalue common.Hash
 	}
+
+	// Changes to transfer records (opcode-level parallel execution)
+	addTransferRecordChange struct{}
 )
 
 func (ch createObjectChange) revert(s *StateDB) {
@@ -465,6 +468,20 @@ func (ch addLogChange) copy() journalEntry {
 	return addLogChange{
 		txhash: ch.txhash,
 	}
+}
+
+func (ch addTransferRecordChange) revert(s *StateDB) {
+	if len(s.transferRecords) > 0 {
+		s.transferRecords = s.transferRecords[:len(s.transferRecords)-1]
+	}
+}
+
+func (ch addTransferRecordChange) dirtied() *common.Address {
+	return nil
+}
+
+func (ch addTransferRecordChange) copy() journalEntry {
+	return addTransferRecordChange{}
 }
 
 func (ch accessListAddAccountChange) revert(s *StateDB) {

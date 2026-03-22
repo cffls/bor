@@ -45,6 +45,13 @@ import (
 	"github.com/ethereum/go-ethereum/trie/utils"
 )
 
+type TransferRecord struct {
+	Sender    common.Address
+	Recipient common.Address
+	Amount    *uint256.Int
+	LogIndex  uint // position in the tx log list where the transfer log should be inserted
+}
+
 // TriesInMemory represents the number of layers that are kept in RAM.
 const TriesInMemory = 128
 
@@ -125,6 +132,8 @@ type StateDB struct {
 
 	// Cached delta-computed balances from GetBalance for mvRecordWritten.
 	cachedDeltaBal map[common.Address]*uint256.Int
+
+	transferRecords []TransferRecord
 
 	// Goroutine suspension support (opcode-level BlockSTM).
 	// When opcodeLevel is true, MVRead blocks on a channel instead of panicking,
@@ -334,6 +343,24 @@ func (s *StateDB) ClearWriteMap() {
 
 func (s *StateDB) HadInvalidRead() bool {
 	return s.dep >= 0
+}
+
+func (s *StateDB) RecordTransfer(sender, recipient common.Address, amount *uint256.Int) bool {
+	if !s.opcodeLevel || s.mvHashmap == nil {
+		return false
+	}
+	s.journal.append(addTransferRecordChange{})
+	s.transferRecords = append(s.transferRecords, TransferRecord{
+		Sender:    sender,
+		Recipient: recipient,
+		Amount:    new(uint256.Int).Set(amount),
+		LogIndex:  uint(len(s.logs[s.thash])),
+	})
+	return true
+}
+
+func (s *StateDB) GetTransferRecords() []TransferRecord {
+	return s.transferRecords
 }
 
 func (s *StateDB) DepTxIndex() int {
