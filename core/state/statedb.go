@@ -123,6 +123,9 @@ type StateDB struct {
 	mvStorageCopied map[common.Address]struct{} // tracks deep-copied objects from storage-only ops (no ADDR write)
 	dep             int
 
+	// Cached delta-computed balances from GetBalance for mvRecordWritten.
+	cachedDeltaBal map[common.Address]*uint256.Int
+
 	// Goroutine suspension support (opcode-level BlockSTM).
 	// When opcodeLevel is true, MVRead blocks on a channel instead of panicking,
 	// allowing the goroutine to resume execution after the dependency completes.
@@ -858,6 +861,14 @@ func (s *StateDB) GetBalance(addr common.Address) *uint256.Int {
 	deltaRes := s.mvHashmap.ReadDelta(balKey, s.txIndex)
 	var rd blockstm.ReadDescriptor
 	rd.Path = balKey
+	// Cache every delta-computed balance for mvRecordWritten consistency
+	defer func() {
+		if s.cachedDeltaBal == nil {
+			s.cachedDeltaBal = make(map[common.Address]*uint256.Int)
+		}
+		s.cachedDeltaBal[addr] = new(uint256.Int).Set(baseBal)
+	}()
+
 	switch deltaRes.Status {
 	case blockstm.MVReadResultDelta:
 		baseBal.Add(baseBal, &deltaRes.Add)
@@ -1327,19 +1338,29 @@ func (s *StateDB) mvRecordWritten(object *stateObject) *stateObject {
 	// Check if already deep-copied by a storage-only operation
 	if s.mvStorageCopied != nil {
 		if _, copied := s.mvStorageCopied[object.Address()]; copied {
-			// Promote: write the ADDR key now (metadata change after storage change)
+			// Promote: apply cached balance fixup if available
+			if s.cachedDeltaBal != nil {
+				if cachedBal, ok := s.cachedDeltaBal[object.Address()]; ok {
+					s.stateObjects[object.Address()].SetBalance(new(uint256.Int).Set(cachedBal))
+				}
+			}
 			MVWrite(s, addrKey)
 			return s.stateObjects[object.Address()]
 		}
 	}
 
 	copied := object.deepCopy(s)
-	// Fix stale balance ONLY when prior txs have written deltas for this
-	// address. If no delta entries exist, the source object's balance is
-	// the best available (it came from MVRead on the ADDR key, which
-	// reflects the latest settled absolute value).
+	// Fix stale balance using cached delta balance from GetBalance (preferred)
+	// or ReadDelta fallback for addresses not read via GetBalance.
 	if s.mvHashmap != nil {
 		addr := object.Address()
+		if s.cachedDeltaBal != nil {
+			if cachedBal, ok := s.cachedDeltaBal[addr]; ok {
+				copied.SetBalance(new(uint256.Int).Set(cachedBal))
+				goto mvRecordWrittenDone
+			}
+		}
+		// Fallback: compute from ReadDelta (may race but covers edge cases)
 		balKey := blockstm.NewSubpathKey(addr, BalancePath)
 		deltaRes := s.mvHashmap.ReadDelta(balKey, s.txIndex)
 		if deltaRes.Status == blockstm.MVReadResultDelta {
@@ -1352,6 +1373,7 @@ func (s *StateDB) mvRecordWritten(object *stateObject) *stateObject {
 			copied.SetBalance(baseBal)
 		}
 	}
+mvRecordWrittenDone:
 	s.setStateObject(copied)
 	MVWrite(s, addrKey)
 
@@ -1382,18 +1404,27 @@ func (s *StateDB) mvRecordWrittenStorageOnly(object *stateObject) *stateObject {
 	copied := object.deepCopy(s)
 	if s.mvHashmap != nil {
 		addr := object.Address()
-		balKey := blockstm.NewSubpathKey(addr, BalancePath)
-		deltaRes := s.mvHashmap.ReadDelta(balKey, s.txIndex)
-		if deltaRes.Status == blockstm.MVReadResultDelta {
-			baseBal := uint256.NewInt(0)
-			if acct, err := s.reader.Account(addr); err == nil && acct != nil {
-				baseBal = new(uint256.Int).Set(acct.Balance)
+		if s.cachedDeltaBal != nil {
+			if cachedBal, ok := s.cachedDeltaBal[addr]; ok {
+				copied.SetBalance(new(uint256.Int).Set(cachedBal))
+				goto storageOnlyDone
 			}
-			baseBal.Add(baseBal, &deltaRes.Add)
-			baseBal.Sub(baseBal, &deltaRes.Sub)
-			copied.SetBalance(baseBal)
+		}
+		{
+			balKey := blockstm.NewSubpathKey(addr, BalancePath)
+			deltaRes := s.mvHashmap.ReadDelta(balKey, s.txIndex)
+			if deltaRes.Status == blockstm.MVReadResultDelta {
+				baseBal := uint256.NewInt(0)
+				if acct, err := s.reader.Account(addr); err == nil && acct != nil {
+					baseBal = new(uint256.Int).Set(acct.Balance)
+				}
+				baseBal.Add(baseBal, &deltaRes.Add)
+				baseBal.Sub(baseBal, &deltaRes.Sub)
+				copied.SetBalance(baseBal)
+			}
 		}
 	}
+storageOnlyDone:
 	s.setStateObject(copied)
 
 	if s.mvStorageCopied == nil {
