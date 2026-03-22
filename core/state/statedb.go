@@ -861,18 +861,14 @@ func (s *StateDB) GetBalance(addr common.Address) *uint256.Int {
 	deltaRes := s.mvHashmap.ReadDelta(balKey, s.txIndex)
 	var rd blockstm.ReadDescriptor
 	rd.Path = balKey
-	// Cache every delta-computed balance for mvRecordWritten consistency
-	defer func() {
-		if s.cachedDeltaBal == nil {
-			s.cachedDeltaBal = make(map[common.Address]*uint256.Int)
-		}
-		s.cachedDeltaBal[addr] = new(uint256.Int).Set(baseBal)
-	}()
-
 	switch deltaRes.Status {
 	case blockstm.MVReadResultDelta:
 		baseBal.Add(baseBal, &deltaRes.Add)
 		baseBal.Sub(baseBal, &deltaRes.Sub)
+		if s.cachedDeltaBal == nil {
+			s.cachedDeltaBal = make(map[common.Address]*uint256.Int)
+		}
+		s.cachedDeltaBal[addr] = new(uint256.Int).Set(baseBal)
 		rd.Kind = blockstm.ReadKindMap
 		rd.V = blockstm.Version{TxnIndex: -2, Incarnation: deltaRes.Version}
 	case blockstm.MVReadResultDependency:
@@ -1360,7 +1356,8 @@ func (s *StateDB) mvRecordWritten(object *stateObject) *stateObject {
 				goto mvRecordWrittenDone
 			}
 		}
-		// Fallback: compute from ReadDelta (may race but covers edge cases)
+		// Fallback: compute from ReadDelta and record as a balance read so
+		// validation catches stale deltas and forces re-execution.
 		balKey := blockstm.NewSubpathKey(addr, BalancePath)
 		deltaRes := s.mvHashmap.ReadDelta(balKey, s.txIndex)
 		if deltaRes.Status == blockstm.MVReadResultDelta {
@@ -1371,6 +1368,18 @@ func (s *StateDB) mvRecordWritten(object *stateObject) *stateObject {
 			baseBal.Add(baseBal, &deltaRes.Add)
 			baseBal.Sub(baseBal, &deltaRes.Sub)
 			copied.SetBalance(baseBal)
+			// Record this read so validation catches delta changes
+			s.ensureReadList()
+			s.readList = append(s.readList, blockstm.ReadDescriptor{
+				Path: balKey,
+				Kind: blockstm.ReadKindMap,
+				V:    blockstm.Version{TxnIndex: -2, Incarnation: deltaRes.Version},
+			})
+			// Cache it too
+			if s.cachedDeltaBal == nil {
+				s.cachedDeltaBal = make(map[common.Address]*uint256.Int)
+			}
+			s.cachedDeltaBal[addr] = new(uint256.Int).Set(baseBal)
 		}
 	}
 mvRecordWrittenDone:
@@ -1421,6 +1430,16 @@ func (s *StateDB) mvRecordWrittenStorageOnly(object *stateObject) *stateObject {
 				baseBal.Add(baseBal, &deltaRes.Add)
 				baseBal.Sub(baseBal, &deltaRes.Sub)
 				copied.SetBalance(baseBal)
+				s.ensureReadList()
+				s.readList = append(s.readList, blockstm.ReadDescriptor{
+					Path: balKey,
+					Kind: blockstm.ReadKindMap,
+					V:    blockstm.Version{TxnIndex: -2, Incarnation: deltaRes.Version},
+				})
+				if s.cachedDeltaBal == nil {
+					s.cachedDeltaBal = make(map[common.Address]*uint256.Int)
+				}
+				s.cachedDeltaBal[addr] = new(uint256.Int).Set(baseBal)
 			}
 		}
 	}
