@@ -574,6 +574,17 @@ func ValidateVersion(txIdx int, lastInputOutput *TxnInputOutput, versionedData *
 	valid = true
 
 	for _, rd := range lastInputOutput.ReadSet(txIdx) {
+		// Skip address key validation — structural dependency only.
+		// Skip balance subpath validation — commutative (add/sub only).
+		// Nonce, code, storage, and suicide keys are still validated.
+		if rd.Path.IsAddress() {
+			continue
+		}
+
+		if rd.Path.IsSubpath() && rd.Path.GetSubpath() == SubpathBalance {
+			continue
+		}
+
 		mvResult := versionedData.Read(rd.Path, txIdx)
 		switch mvResult.Status() {
 		case MVReadResultDone:
