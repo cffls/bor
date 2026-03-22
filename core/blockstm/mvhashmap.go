@@ -163,6 +163,9 @@ type MVHashMap struct {
 	// Predicted keys per tx for false-positive cleanup after execution.
 	// Set by conflict predictor; used by CleanupPredictions.
 	predictedKeys map[int][]Key
+
+	// Delta-based balance tracking.
+	BalanceDeltas *BalanceDeltaMap
 }
 
 // closedSentinel is a pre-closed channel reused as the "completed" marker in
@@ -176,7 +179,8 @@ var closedSentinel = func() chan struct{} {
 
 func MakeMVHashMap() *MVHashMap {
 	mv := &MVHashMap{
-		shutdownCh: make(chan struct{}),
+		shutdownCh:    make(chan struct{}),
+		BalanceDeltas: NewBalanceDeltaMap(),
 	}
 	for i := range mv.shards {
 		mv.shards[i].m = make(map[Key]*TxnIndexCells)
