@@ -588,6 +588,18 @@ func (s *StateDB) ApplyMVWriteSet(writes []blockstm.WriteDescriptor) {
 
 			switch path.GetSubpath() {
 			case BalancePath:
+				if sr.mvHashmap != nil {
+					add, sub, found := sr.mvHashmap.GetTxDelta(path, writes[i].V.TxnIndex)
+					if found {
+						if !add.IsZero() {
+							s.AddBalance(addr, &add, tracing.BalanceChangeTransfer)
+						}
+						if !sub.IsZero() {
+							s.SubBalance(addr, &sub, tracing.BalanceChangeTransfer)
+						}
+						continue
+					}
+				}
 				if pair.src != nil {
 					s.SetBalance(addr, pair.src.Balance(), tracing.BalanceChangeUnspecified)
 				} else {
@@ -825,13 +837,63 @@ const SuicidePath = 4
 
 // GetBalance retrieves the balance from the given address or 0 if object not found
 func (s *StateDB) GetBalance(addr common.Address) *uint256.Int {
-	return MVRead(s, blockstm.NewSubpathKey(addr, BalancePath), uint256.NewInt(0), func(s *StateDB) *uint256.Int {
+	if s.mvHashmap == nil {
 		stateObject := s.getStateObject(addr)
 		if stateObject != nil {
 			return stateObject.Balance()
 		}
 		return uint256.NewInt(0)
-	})
+	}
+	balKey := blockstm.NewSubpathKey(addr, BalancePath)
+	if s.writeIndex != nil {
+		if _, addrWritten := s.writeAddrs[addr]; addrWritten {
+			if writeHasKey(s, balKey) {
+				if obj := s.stateObjects[addr]; obj != nil {
+					return obj.Balance()
+				}
+			}
+		}
+	}
+	// Ensure stateObject is loaded into cache (needed by Finalise/IntermediateRoot).
+	// We don't use its balance (it may be stale from a prior tx), but the object
+	// must exist in s.stateObjects for trie updates.
+	s.getStateObject(addr)
+
+	baseBal := uint256.NewInt(0)
+	if acct, err := s.reader.Account(addr); err == nil && acct != nil {
+		baseBal = new(uint256.Int).Set(acct.Balance)
+	}
+	deltaRes := s.mvHashmap.ReadDelta(balKey, s.txIndex)
+	var rd blockstm.ReadDescriptor
+	rd.Path = balKey
+	switch deltaRes.Status {
+	case blockstm.MVReadResultDelta:
+		baseBal.Add(baseBal, &deltaRes.Add)
+		baseBal.Sub(baseBal, &deltaRes.Sub)
+		rd.Kind = blockstm.ReadKindMap
+		rd.V = blockstm.Version{TxnIndex: -2, Incarnation: deltaRes.Version}
+	case blockstm.MVReadResultDependency:
+		if !s.opcodeLevel {
+			s.dep = deltaRes.DepIdx
+			panic("Found dependency")
+		}
+		mvh := s.mvHashmap
+		waitCh := mvh.WaitForTx(deltaRes.DepIdx)
+		mvh.OnWorkerSuspend()
+		select {
+		case <-waitCh:
+			return s.GetBalance(addr)
+		case <-mvh.ShutdownCh():
+			s.dep = deltaRes.DepIdx
+			panic("Found dependency")
+		}
+	default:
+		rd.Kind = blockstm.ReadKindStorage
+		rd.V = blockstm.Version{TxnIndex: -1, Incarnation: -1}
+	}
+	s.ensureReadList()
+	s.readList = append(s.readList, rd)
+	return baseBal
 }
 
 // GetNonce retrieves the nonce from the given address or 0 if object not found
@@ -1003,12 +1065,15 @@ func (s *StateDB) AddBalance(addr common.Address, amount *uint256.Int, reason tr
 	if stateObject == nil {
 		return uint256.Int{}
 	}
-
-	// No GetBalance read recording: AddBalance is a blind write.
-	// The ADDR key (from mvRecordWritten) propagates the state object.
-	// The BAL key write stores the result. No BAL read → no BAL conflict.
 	stateObject = s.mvRecordWritten(stateObject)
-	MVWrite(s, blockstm.NewSubpathKey(addr, BalancePath))
+	if amount.IsZero() {
+		return *(stateObject.Balance())
+	}
+	balKey := blockstm.NewSubpathKey(addr, BalancePath)
+	if s.mvHashmap != nil {
+		s.mvHashmap.WriteDelta(balKey, s.Version(), amount, nil)
+	}
+	MVWrite(s, balKey)
 	return stateObject.AddBalance(amount)
 }
 
@@ -1018,13 +1083,15 @@ func (s *StateDB) SubBalance(addr common.Address, amount *uint256.Int, reason tr
 	if stateObject == nil {
 		return uint256.Int{}
 	}
-
-	stateObject = s.mvRecordWritten(stateObject)
-	MVWrite(s, blockstm.NewSubpathKey(addr, BalancePath))
-
 	if amount.IsZero() {
 		return *(stateObject.Balance())
 	}
+	stateObject = s.mvRecordWritten(stateObject)
+	balKey := blockstm.NewSubpathKey(addr, BalancePath)
+	if s.mvHashmap != nil {
+		s.mvHashmap.WriteDelta(balKey, s.Version(), nil, amount)
+	}
+	MVWrite(s, balKey)
 	return stateObject.SetBalance(new(uint256.Int).Sub(stateObject.Balance(), amount))
 }
 
@@ -1274,7 +1341,22 @@ func (s *StateDB) mvRecordWritten(object *stateObject) *stateObject {
 		}
 	}
 
-	s.setStateObject(object.deepCopy(s))
+	copied := object.deepCopy(s)
+	if s.mvHashmap != nil {
+		addr := object.Address()
+		balKey := blockstm.NewSubpathKey(addr, BalancePath)
+		deltaRes := s.mvHashmap.ReadDelta(balKey, s.txIndex)
+		baseBal := uint256.NewInt(0)
+		if acct, err := s.reader.Account(addr); err == nil && acct != nil {
+			baseBal = new(uint256.Int).Set(acct.Balance)
+		}
+		if deltaRes.Status == blockstm.MVReadResultDelta {
+			baseBal.Add(baseBal, &deltaRes.Add)
+			baseBal.Sub(baseBal, &deltaRes.Sub)
+		}
+		copied.SetBalance(baseBal)
+	}
+	s.setStateObject(copied)
 	MVWrite(s, addrKey)
 
 	return s.stateObjects[object.Address()]
@@ -1301,7 +1383,22 @@ func (s *StateDB) mvRecordWrittenStorageOnly(object *stateObject) *stateObject {
 		}
 	}
 
-	s.setStateObject(object.deepCopy(s))
+	copied := object.deepCopy(s)
+	if s.mvHashmap != nil {
+		addr := object.Address()
+		balKey := blockstm.NewSubpathKey(addr, BalancePath)
+		deltaRes := s.mvHashmap.ReadDelta(balKey, s.txIndex)
+		baseBal := uint256.NewInt(0)
+		if acct, err := s.reader.Account(addr); err == nil && acct != nil {
+			baseBal = new(uint256.Int).Set(acct.Balance)
+		}
+		if deltaRes.Status == blockstm.MVReadResultDelta {
+			baseBal.Add(baseBal, &deltaRes.Add)
+			baseBal.Sub(baseBal, &deltaRes.Sub)
+		}
+		copied.SetBalance(baseBal)
+	}
+	s.setStateObject(copied)
 
 	if s.mvStorageCopied == nil {
 		s.mvStorageCopied = make(map[common.Address]struct{})
