@@ -628,13 +628,14 @@ func (mv *MVHashMap) ReadDelta(k Key, txIdx int) DeltaReadResult {
 			break
 		}
 		switch entry.cell.flag {
-		case FlagDelta, FlagEstimate:
-			// FlagEstimate entries retain stale delta values from the prior incarnation.
-			// For commutative balance tracking we use them speculatively; validation
-			// is skipped for delta reads (TxnIndex == -2) so the caller accepts
-			// approximate values. Settlement always uses pair.src.Balance() (absolute).
+		case FlagDelta:
 			totalAdd.Add(&totalAdd, &entry.cell.deltaAdd)
 			totalSub.Add(&totalSub, &entry.cell.deltaSub)
+		case FlagEstimate:
+			// FlagEstimate should not exist for balance delta entries
+			// (MarkEstimate is skipped for balance keys). If we get here,
+			// it's a bug — return dependency to force suspension/abort.
+			return DeltaReadResult{Status: MVReadResultDependency, DepIdx: entry.index}
 		case FlagDone:
 			return DeltaReadResult{Status: MVReadResultDone, DepIdx: entry.index}
 		}
@@ -642,7 +643,13 @@ func (mv *MVHashMap) ReadDelta(k Key, txIdx int) DeltaReadResult {
 	if totalAdd.IsZero() && totalSub.IsZero() {
 		return DeltaReadResult{Status: MVReadResultNone}
 	}
-	version := int(totalAdd.Uint64()>>1 ^ totalSub.Uint64()>>1)
+	// Use all 256 bits for the version hash to avoid collisions on large balances
+	addBytes := totalAdd.Bytes32()
+	subBytes := totalSub.Bytes32()
+	version := int(0)
+	for j := 0; j < 32; j++ {
+		version = version*31 + int(addBytes[j]) + int(subBytes[j])*37
+	}
 	return DeltaReadResult{Status: MVReadResultDelta, Add: totalAdd, Sub: totalSub, Version: version}
 }
 
@@ -715,6 +722,22 @@ func ValidateVersion(txIdx int, lastInputOutput *TxnInputOutput, versionedData *
 		}
 
 		if rd.V.TxnIndex == -2 {
+			deltaRes := versionedData.ReadDelta(rd.Path, txIdx)
+			switch deltaRes.Status {
+			case MVReadResultDelta:
+				if deltaRes.Version != rd.V.Incarnation {
+					valid = false
+				}
+			case MVReadResultNone:
+				if rd.V.Incarnation != 0 {
+					valid = false
+				}
+			default:
+				valid = false
+			}
+			if !valid {
+				break
+			}
 			continue
 		}
 

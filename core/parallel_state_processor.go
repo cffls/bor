@@ -196,6 +196,10 @@ func (task *ExecutionTask) Settle() {
 	task.finalStateDB.SetTxContext(task.tx.Hash(), task.index)
 
 	coinbaseBalance := task.finalStateDB.GetBalance(task.coinbase)
+	// Re-read sender balance from the settled state (not from speculative execution).
+	// The speculative SenderInitBalance may be stale if the opcode-level executor
+	// read it during a goroutine suspension with partially accumulated deltas.
+	senderInitBalance := task.finalStateDB.GetBalance(task.msg.From)
 
 	task.finalStateDB.ApplyMVWriteSet(task.statedb.MVWriteList())
 
@@ -209,7 +213,9 @@ func (task *ExecutionTask) Settle() {
 		}
 
 		task.finalStateDB.AddBalance(task.coinbase, cmath.BigIntToUint256Int(task.result.FeeTipped), tracing.BalanceChangeTransfer)
-		output1 := new(big.Int).SetBytes(task.result.SenderInitBalance.Bytes())
+		// Use settled sender balance (not speculative) for the fee transfer log.
+		senderBal := senderInitBalance.ToBig()
+		output1 := new(big.Int).Set(senderBal)
 		output2 := new(big.Int).SetBytes(coinbaseBalance.Bytes())
 
 		// Deprecating transfer log and will be removed in future fork. PLEASE DO NOT USE this transfer log going forward. Parameters won't get updated as expected going forward with EIP1559
@@ -221,7 +227,7 @@ func (task *ExecutionTask) Settle() {
 			task.coinbase,
 
 			task.result.FeeTipped,
-			task.result.SenderInitBalance,
+			senderBal,
 			coinbaseBalance.ToBig(),
 			output1.Sub(output1, task.result.FeeTipped),
 			output2.Add(output2, task.result.FeeTipped),

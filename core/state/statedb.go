@@ -1334,19 +1334,23 @@ func (s *StateDB) mvRecordWritten(object *stateObject) *stateObject {
 	}
 
 	copied := object.deepCopy(s)
+	// Fix stale balance ONLY when prior txs have written deltas for this
+	// address. If no delta entries exist, the source object's balance is
+	// the best available (it came from MVRead on the ADDR key, which
+	// reflects the latest settled absolute value).
 	if s.mvHashmap != nil {
 		addr := object.Address()
 		balKey := blockstm.NewSubpathKey(addr, BalancePath)
 		deltaRes := s.mvHashmap.ReadDelta(balKey, s.txIndex)
-		baseBal := uint256.NewInt(0)
-		if acct, err := s.reader.Account(addr); err == nil && acct != nil {
-			baseBal = new(uint256.Int).Set(acct.Balance)
-		}
 		if deltaRes.Status == blockstm.MVReadResultDelta {
+			baseBal := uint256.NewInt(0)
+			if acct, err := s.reader.Account(addr); err == nil && acct != nil {
+				baseBal = new(uint256.Int).Set(acct.Balance)
+			}
 			baseBal.Add(baseBal, &deltaRes.Add)
 			baseBal.Sub(baseBal, &deltaRes.Sub)
+			copied.SetBalance(baseBal)
 		}
-		copied.SetBalance(baseBal)
 	}
 	s.setStateObject(copied)
 	MVWrite(s, addrKey)
@@ -1380,15 +1384,15 @@ func (s *StateDB) mvRecordWrittenStorageOnly(object *stateObject) *stateObject {
 		addr := object.Address()
 		balKey := blockstm.NewSubpathKey(addr, BalancePath)
 		deltaRes := s.mvHashmap.ReadDelta(balKey, s.txIndex)
-		baseBal := uint256.NewInt(0)
-		if acct, err := s.reader.Account(addr); err == nil && acct != nil {
-			baseBal = new(uint256.Int).Set(acct.Balance)
-		}
 		if deltaRes.Status == blockstm.MVReadResultDelta {
+			baseBal := uint256.NewInt(0)
+			if acct, err := s.reader.Account(addr); err == nil && acct != nil {
+				baseBal = new(uint256.Int).Set(acct.Balance)
+			}
 			baseBal.Add(baseBal, &deltaRes.Add)
 			baseBal.Sub(baseBal, &deltaRes.Sub)
+			copied.SetBalance(baseBal)
 		}
-		copied.SetBalance(baseBal)
 	}
 	s.setStateObject(copied)
 

@@ -1371,3 +1371,124 @@ func TestMainnetSerialVsParallel(t *testing.T) {
 		}
 	}
 }
+
+// TestOpcodeReceiptDeterminism identifies which tx(s) have non-deterministic
+// receipts in opcode-level mode by running the same block multiple times and
+// comparing individual receipt gas usage.
+func TestOpcodeReceiptDeterminism(t *testing.T) {
+	alchemyURL := getAlchemyURL(t)
+	blocks, diskdb := loadTestBlocks(t, alchemyURL)
+
+	config := params.BorMainnetChainConfig
+	engine := &benchConsensus{}
+
+	// Focus on block 0x4EC6D18 (index 8) which has state root failures
+	blockIdx := 8
+	bd := blocks[blockIdx]
+	author := getAuthor(config, bd.witness.Header())
+
+	// Run serial once to get reference receipts
+	serialRes, err := func() (*ProcessResult, error) {
+		memdb := bd.witness.MakeHashDB(diskdb)
+		db, err := state.New(bd.witness.Root(), state.NewDatabase(triedb.NewDatabase(memdb, triedb.HashDefaults), nil))
+		if err != nil {
+			return nil, err
+		}
+		hc := &HeaderChain{config: config, chainDb: memdb, headerCache: lru.NewCache[common.Hash, *types.Header](256), engine: engine}
+		for _, h := range bd.witness.Headers {
+			hc.headerCache.Add(h.Hash(), h)
+		}
+		processor := NewStateProcessor(hc)
+		return processor.Process(bd.block, db, vm.Config{}, &author, context.Background())
+	}()
+	if err != nil {
+		t.Fatalf("serial: %v", err)
+	}
+
+	numProcs := runtime.NumCPU()
+
+	// Run opcode-level 5 times and compare receipts
+	for run := 0; run < 5; run++ {
+		memdb := bd.witness.MakeHashDB(diskdb)
+		db, err := state.New(bd.witness.Root(), state.NewDatabase(triedb.NewDatabase(memdb, triedb.HashDefaults), nil))
+		if err != nil {
+			t.Fatalf("state.New: %v", err)
+		}
+		bc := &BlockChain{
+			hc:                           &HeaderChain{config: config, chainDb: memdb, headerCache: lru.NewCache[common.Hash, *types.Header](256), engine: engine},
+			parallelSpeculativeProcesses: numProcs,
+			opcodeLevel:                  true,
+		}
+		for _, h := range bd.witness.Headers {
+			bc.hc.headerCache.Add(h.Hash(), h)
+		}
+		processor := NewParallelStateProcessor(&benchHeaderChain{config: config, chainDb: memdb, headerCache: bc.hc.headerCache, engine: engine}, bc)
+		opcodeRes, err := processor.Process(bd.block, db, vm.Config{}, &author, context.Background())
+		if err != nil {
+			t.Fatalf("opcode run %d: %v", run, err)
+		}
+
+		stateRoot := db.IntermediateRoot(config.IsEIP158(bd.block.Number()))
+		receiptRoot := types.DeriveSha(opcodeRes.Receipts, trie.NewStackTrie(nil))
+		serialReceiptRoot := types.DeriveSha(serialRes.Receipts, trie.NewStackTrie(nil))
+		serialStateRoot := func() common.Hash {
+			memdb2 := bd.witness.MakeHashDB(diskdb)
+			db2, _ := state.New(bd.witness.Root(), state.NewDatabase(triedb.NewDatabase(memdb2, triedb.HashDefaults), nil))
+			hc2 := &HeaderChain{config: config, chainDb: memdb2, headerCache: lru.NewCache[common.Hash, *types.Header](256), engine: engine}
+			for _, h := range bd.witness.Headers {
+				hc2.headerCache.Add(h.Hash(), h)
+			}
+			p2 := NewStateProcessor(hc2)
+			_, _ = p2.Process(bd.block, db2, vm.Config{}, &author, context.Background())
+			return db2.IntermediateRoot(config.IsEIP158(bd.block.Number()))
+		}()
+
+		stateMatch := stateRoot == serialStateRoot
+		receiptMatch := receiptRoot == serialReceiptRoot
+
+		// Compare each receipt including logs
+		mismatches := 0
+		for ti := 0; ti < len(serialRes.Receipts) && ti < len(opcodeRes.Receipts); ti++ {
+			sr := serialRes.Receipts[ti]
+			or := opcodeRes.Receipts[ti]
+			logDiff := len(sr.Logs) != len(or.Logs)
+			if !logDiff {
+				for li := range sr.Logs {
+					if sr.Logs[li].Address != or.Logs[li].Address || len(sr.Logs[li].Topics) != len(or.Logs[li].Topics) {
+						logDiff = true
+						break
+					}
+				}
+			}
+			cumGasDiff := sr.CumulativeGasUsed != or.CumulativeGasUsed
+			if sr.GasUsed != or.GasUsed || sr.Status != or.Status || logDiff || cumGasDiff {
+				if mismatches < 3 {
+					t.Logf("run=%d tx=%d gasUsed:%d/%d status:%d/%d logs:%d/%d cumGas:%d/%d",
+						run, ti, sr.GasUsed, or.GasUsed, sr.Status, or.Status,
+						len(sr.Logs), len(or.Logs), sr.CumulativeGasUsed, or.CumulativeGasUsed)
+				}
+				mismatches++
+			}
+		}
+		// If receipt root mismatches, find the first differing receipt RLP
+		if !receiptMatch && mismatches == 0 {
+			for ti := range serialRes.Receipts {
+				srlp, _ := serialRes.Receipts[ti].MarshalBinary()
+				orlp, _ := opcodeRes.Receipts[ti].MarshalBinary()
+				if !bytes.Equal(srlp, orlp) {
+					t.Errorf("run=%d tx=%d: receipt RLP differs (len serial=%d opcode=%d)",
+						run, ti, len(srlp), len(orlp))
+					break
+				}
+			}
+		}
+
+		if mismatches > 0 || !stateMatch {
+			t.Errorf("run=%d: %d receipts differ, stateMatch=%v receiptMatch=%v",
+				run, mismatches, stateMatch, receiptMatch)
+		} else {
+			t.Logf("run=%d: all %d receipts match, state=%v receipt=%v",
+				run, len(serialRes.Receipts), stateMatch, receiptMatch)
+		}
+	}
+}
