@@ -841,7 +841,16 @@ func (s *StateDB) Exist(addr common.Address) bool {
 // or empty according to the EIP161 specification (balance = nonce = code = 0)
 func (s *StateDB) Empty(addr common.Address) bool {
 	so := s.getStateObject(addr)
-	return so == nil || so.empty()
+	if so == nil {
+		return true
+	}
+	// In parallel mode, use GetBalance for the balance check to ensure
+	// the delta-accumulated value is used (and a read descriptor is recorded
+	// for validation). The stateObject's balance may be stale.
+	if s.mvHashmap != nil {
+		return so.Nonce() == 0 && common.BytesToHash(so.CodeHash()) == types.EmptyCodeHash && s.GetBalance(addr).IsZero()
+	}
+	return so.empty()
 }
 
 // Create a unique path for special fields (e.g. balance, code) in a state object.
