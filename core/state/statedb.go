@@ -859,7 +859,7 @@ const SuicidePath = 4
 
 // GetBalance retrieves the balance from the given address or 0 if object not found
 func (s *StateDB) GetBalance(addr common.Address) *uint256.Int {
-	if true || s.mvHashmap == nil { // FORCE non-delta path
+	if s.mvHashmap == nil {
 		stateObject := s.getStateObject(addr)
 		if stateObject != nil {
 			return stateObject.Balance()
