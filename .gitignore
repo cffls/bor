@@ -69,3 +69,7 @@ state.test
 stacks.log
 pprof/
 .claude/worktrees/
+docs/delayed-src-design.md
+docs/next-block-gas-limit-formula.*
+genesis.json
+triedb-go/
