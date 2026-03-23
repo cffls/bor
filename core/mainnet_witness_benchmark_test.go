@@ -724,7 +724,16 @@ func TestMainnetWitnessConsistency(t *testing.T) {
 			t.Errorf("block %s: opcode-level receiptRoot mismatch: serial=%s opcode=%s", testBlockHexes[i], serialReceipt.Hex(), opcodeReceipt.Hex())
 		}
 
-		t.Logf("block %s: all modes consistent (state=%s receipt=%s)", testBlockHexes[i], serialState.Hex()[:10], serialReceipt.Hex()[:10])
+		// Validate against block header (when serial matches header, parallel must too)
+		if serialState == bd.stateRoot && serialReceipt == bd.receiptRoot {
+			t.Logf("block %s: all modes consistent and match block header", testBlockHexes[i])
+		} else if bd.stateRoot != (common.Hash{}) {
+			t.Logf("block %s: all modes consistent (state=%s receipt=%s) header state=%s receipt=%s",
+				testBlockHexes[i], serialState.Hex()[:10], serialReceipt.Hex()[:10],
+				bd.stateRoot.Hex()[:10], bd.receiptRoot.Hex()[:10])
+		} else {
+			t.Logf("block %s: all modes consistent (state=%s receipt=%s)", testBlockHexes[i], serialState.Hex()[:10], serialReceipt.Hex()[:10])
+		}
 	}
 }
 
