@@ -1513,6 +1513,8 @@ func TestNewBlocksConsistency(t *testing.T) {
 			continue
 		}
 		blockHex := strings.TrimSuffix(entry.Name(), ".witness")
+		// Force cleanup of goroutines from previous block's parallel execution
+		runtime.GC()
 		// Fresh diskdb per block to avoid cross-block contamination
 		// Skip blocks we know are OK to focus on failing ones
 		if blockHex != "0x4F2B1C4" && blockHex != "0x4F2B1D8" {
