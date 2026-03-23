@@ -62,3 +62,10 @@ cmd/geth/geth
 cmd/rlpdump/rlpdump
 cmd/workload/workload
 cmd/keeper/keeper
+
+# Build artifacts and debug files
+core.test
+state.test
+stacks.log
+pprof/
+.claude/worktrees/
