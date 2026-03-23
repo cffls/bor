@@ -52,6 +52,11 @@ type TransferRecord struct {
 	LogIndex  uint // position in the tx log list where the transfer log should be inserted
 }
 
+type preWriteKey struct {
+	addr common.Address
+	slot common.Hash
+}
+
 // TriesInMemory represents the number of layers that are kept in RAM.
 const TriesInMemory = 128
 
@@ -131,7 +136,8 @@ type StateDB struct {
 	dep             int
 
 	// Cached delta-computed balances from GetBalance for mvRecordWritten.
-	cachedDeltaBal map[common.Address]*uint256.Int
+	cachedDeltaBal  map[common.Address]*uint256.Int
+	preWriteStorage map[preWriteKey]common.Hash // pre-SSTORE values for GetStateAndCommittedState
 
 	transferRecords []TransferRecord
 
@@ -1095,6 +1101,19 @@ func (s *StateDB) GetCommittedState(addr common.Address, hash common.Hash) commo
 
 // GetStateAndCommittedState returns the current value and the original value.
 func (s *StateDB) GetStateAndCommittedState(addr common.Address, hash common.Hash) (common.Hash, common.Hash) {
+	if s.mvHashmap != nil {
+		// Current value goes through GetState (MVRead with self-write shortcut).
+		current := s.GetState(addr, hash)
+		// Committed value = value at start of this tx.
+		// If this tx wrote this slot, we stored the pre-write value in
+		// preWriteStorage. Otherwise, committed == current.
+		if s.preWriteStorage != nil {
+			if pre, ok := s.preWriteStorage[preWriteKey{addr, hash}]; ok {
+				return current, pre
+			}
+		}
+		return current, current
+	}
 	stateObject := s.getStateObject(addr)
 	if stateObject != nil {
 		return stateObject.getState(hash)
@@ -1219,8 +1238,18 @@ func (s *StateDB) SetCode(addr common.Address, code []byte, reason tracing.CodeC
 func (s *StateDB) SetState(addr common.Address, key, value common.Hash) common.Hash {
 	stateObject := s.getOrNewStateObject(addr)
 	if stateObject != nil {
-		// Storage-only: skip ADDR key write. StateKey tracks the slot dependency.
 		stateObject = s.mvRecordWrittenStorageOnly(stateObject)
+		// Record the pre-write value for GetStateAndCommittedState (SSTORE gas).
+		// Must be recorded BEFORE MVWrite marks the key as self-written.
+		if s.mvHashmap != nil {
+			pk := preWriteKey{addr, key}
+			if s.preWriteStorage == nil {
+				s.preWriteStorage = make(map[preWriteKey]common.Hash)
+			}
+			if _, exists := s.preWriteStorage[pk]; !exists {
+				s.preWriteStorage[pk] = s.GetState(addr, key)
+			}
+		}
 		MVWrite(s, blockstm.NewStateKey(addr, key))
 		return stateObject.SetState(key, value)
 	}
