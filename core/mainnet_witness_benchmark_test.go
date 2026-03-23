@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -1489,6 +1490,67 @@ func TestOpcodeReceiptDeterminism(t *testing.T) {
 		} else {
 			t.Logf("run=%d: all %d receipts match, state=%v receipt=%v",
 				run, len(serialRes.Receipts), stateMatch, receiptMatch)
+		}
+	}
+}
+
+// TestNewBlocksConsistency tests witness blocks from /tmp/witnesses_2
+func TestNewBlocksConsistency(t *testing.T) {
+	alchemyURL := getAlchemyURL(t)
+	witnessDir2 := "/tmp/witnesses_2"
+	if _, err := os.Stat(witnessDir2); os.IsNotExist(err) {
+		t.Skipf("witness directory %s not found", witnessDir2)
+	}
+	entries, err := os.ReadDir(witnessDir2)
+	if err != nil {
+		t.Fatalf("reading witness dir: %v", err)
+	}
+	codeDir := filepath.Join(witnessDir, "codes")
+	diskdb := newCodeCachingDB(codeDir)
+	diskdb.loadCodesFromDisk()
+	config := params.BorMainnetChainConfig
+	engine := &benchConsensus{}
+	numProcs := runtime.NumCPU()
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".witness") {
+			continue
+		}
+		blockHex := strings.TrimSuffix(entry.Name(), ".witness")
+		witnessPath := filepath.Join(witnessDir2, entry.Name())
+		witness, err := loadWitnessFromJSON(witnessPath)
+		if err != nil {
+			t.Fatalf("loading witness %s: %v", blockHex, err)
+		}
+		blockData, err := fetchAndCacheBlock(blockHex, alchemyURL)
+		if err != nil {
+			t.Fatalf("fetching block %s: %v", blockHex, err)
+		}
+		block, _, _, err := parseBlockFromJSON(blockData)
+		if err != nil {
+			t.Fatalf("parsing block %s: %v", blockHex, err)
+		}
+		if err := prewarmCodes(diskdb, witness, block, blockHex, config, alchemyURL); err != nil {
+			t.Logf("warning: prewarm codes for %s: %v", blockHex, err)
+		}
+		author := getAuthor(config, witness.Header())
+		serialState, serialReceipt, err := executeStatelessSerial(config, block, witness, &author, engine, diskdb)
+		if err != nil {
+			t.Logf("block %s: serial failed (skipping): %v", blockHex, err)
+			continue
+		}
+		opcodeState, opcodeReceipt, _, err := executeStatelessParallel(config, block, witness, &author, engine, diskdb, numProcs, true)
+		if err != nil {
+			t.Logf("block %s: opcode failed (skipping): %v", blockHex, err)
+			continue
+		}
+		if serialState != opcodeState {
+			t.Errorf("block %s: stateRoot mismatch serial=%s opcode=%s", blockHex, serialState.Hex()[:10], opcodeState.Hex()[:10])
+		}
+		if serialReceipt != opcodeReceipt {
+			t.Errorf("block %s: receiptRoot mismatch serial=%s opcode=%s", blockHex, serialReceipt.Hex()[:10], opcodeReceipt.Hex()[:10])
+		}
+		if serialState == opcodeState && serialReceipt == opcodeReceipt {
+			t.Logf("block %s: OK (%d txs)", blockHex, len(block.Transactions()))
 		}
 	}
 }

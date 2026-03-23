@@ -1420,16 +1420,12 @@ func (s *StateDB) mvRecordWritten(object *stateObject) *stateObject {
 	}
 
 	copied := object.deepCopy(s)
-	// Populate the delta balance cache if needed. GetBalance records a read
-	// descriptor so validation catches stale deltas.
-	if s.mvHashmap != nil {
-		addr := object.Address()
-		hasCached := s.cachedDeltaBal != nil && s.cachedDeltaBal[addr] != nil
-		if !hasCached {
-			s.getBalanceForCache(addr)
-		}
-	}
-	// Apply cached balance (always populated after the above)
+	// Apply cached delta balance if available (populated by a prior GetBalance).
+	// Do NOT call getBalanceForCache here — the ReadDelta races with concurrent
+	// WriteDelta and produces non-deterministic balances. If no cache exists,
+	// keep the stateObject's original balance. This is safe because
+	// mvRecordWrittenStorageOnly only handles storage-only writes — if a
+	// balance write follows, mvRecordWritten's Promote path applies the cache.
 	if s.cachedDeltaBal != nil {
 		if cachedBal, ok := s.cachedDeltaBal[object.Address()]; ok {
 			copied.SetBalance(new(uint256.Int).Set(cachedBal))
