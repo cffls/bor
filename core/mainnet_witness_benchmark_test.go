@@ -1545,12 +1545,106 @@ func TestNewBlocksConsistency(t *testing.T) {
 		}
 		if serialState != opcodeState {
 			t.Errorf("block %s: stateRoot mismatch serial=%s opcode=%s", blockHex, serialState.Hex()[:10], opcodeState.Hex()[:10])
-		}
-		if serialReceipt != opcodeReceipt {
-			t.Errorf("block %s: receiptRoot mismatch serial=%s opcode=%s", blockHex, serialReceipt.Hex()[:10], opcodeReceipt.Hex()[:10])
-		}
-		if serialState == opcodeState && serialReceipt == opcodeReceipt {
+		} else if serialReceipt != opcodeReceipt {
+			t.Errorf("block %s: receiptRoot mismatch (state OK) serial=%s opcode=%s", blockHex, serialReceipt.Hex()[:10], opcodeReceipt.Hex()[:10])
+		} else {
 			t.Logf("block %s: OK (%d txs)", blockHex, len(block.Transactions()))
+		}
+	}
+}
+
+// TestBlock0x4F2B1B6 focuses on the failing block with per-receipt comparison
+func TestBlock0x4F2B1B6(t *testing.T) {
+	alchemyURL := getAlchemyURL(t)
+	witnessDir2 := "/tmp/witnesses_2"
+	blockHex := "0x4F2B1B6"
+	witnessPath := filepath.Join(witnessDir2, blockHex+".witness")
+	codeDir := filepath.Join(witnessDir, "codes")
+	diskdb := newCodeCachingDB(codeDir)
+	diskdb.loadCodesFromDisk()
+	config := params.BorMainnetChainConfig
+	engine := &benchConsensus{}
+	witness, err := loadWitnessFromJSON(witnessPath)
+	if err != nil { t.Fatalf("loading witness: %v", err) }
+	blockData, err := fetchAndCacheBlock(blockHex, alchemyURL)
+	if err != nil { t.Fatalf("fetching block: %v", err) }
+	block, _, _, err := parseBlockFromJSON(blockData)
+	if err != nil { t.Fatalf("parsing block: %v", err) }
+	if err := prewarmCodes(diskdb, witness, block, blockHex, config, alchemyURL); err != nil {
+		t.Logf("prewarm: %v", err)
+	}
+	author := getAuthor(config, witness.Header())
+	// Run serial once
+	serialRes, err := func() (*ProcessResult, error) {
+		memdb := witness.MakeHashDB(diskdb)
+		db, _ := state.New(witness.Root(), state.NewDatabase(triedb.NewDatabase(memdb, triedb.HashDefaults), nil))
+		hc := &HeaderChain{config: config, chainDb: memdb, headerCache: lru.NewCache[common.Hash, *types.Header](256), engine: engine}
+		for _, h := range witness.Headers { hc.headerCache.Add(h.Hash(), h) }
+		p := NewStateProcessor(hc)
+		return p.Process(block, db, vm.Config{}, &author, context.Background())
+	}()
+	if err != nil { t.Fatalf("serial: %v", err) }
+	numProcs := runtime.NumCPU()
+	for run := 0; run < 20; run++ {
+		memdb := witness.MakeHashDB(diskdb)
+		db, _ := state.New(witness.Root(), state.NewDatabase(triedb.NewDatabase(memdb, triedb.HashDefaults), nil))
+		bc := &BlockChain{
+			hc: &HeaderChain{config: config, chainDb: memdb, headerCache: lru.NewCache[common.Hash, *types.Header](256), engine: engine},
+			parallelSpeculativeProcesses: numProcs, opcodeLevel: true,
+		}
+		for _, h := range witness.Headers { bc.hc.headerCache.Add(h.Hash(), h) }
+		p := NewParallelStateProcessor(&benchHeaderChain{config: config, chainDb: memdb, headerCache: bc.hc.headerCache, engine: engine}, bc)
+		opcodeRes, err := p.Process(block, db, vm.Config{}, &author, context.Background())
+		if err != nil { t.Fatalf("run %d: %v", run, err) }
+		// Compare gas
+		if serialRes.GasUsed != opcodeRes.GasUsed {
+			t.Errorf("run=%d TOTAL GAS MISMATCH serial=%d opcode=%d diff=%d",
+				run, serialRes.GasUsed, opcodeRes.GasUsed, int64(opcodeRes.GasUsed)-int64(serialRes.GasUsed))
+			for ti := range serialRes.Receipts {
+				sr := serialRes.Receipts[ti]
+				or := opcodeRes.Receipts[ti]
+				if sr.GasUsed != or.GasUsed {
+					t.Errorf("  tx=%d gasUsed serial=%d opcode=%d diff=%d status_s=%d status_o=%d",
+						ti, sr.GasUsed, or.GasUsed, int64(or.GasUsed)-int64(sr.GasUsed), sr.Status, or.Status)
+				}
+			}
+			break // stop after first mismatch to get clean output
+		} else {
+			t.Logf("run=%d OK gas=%d", run, serialRes.GasUsed)
+		}
+	}
+}
+
+func TestBlock0x4F2B1B6_Baseline(t *testing.T) {
+	alchemyURL := getAlchemyURL(t)
+	witnessDir2 := "/tmp/witnesses_2"
+	blockHex := "0x4F2B1B6"
+	witnessPath := filepath.Join(witnessDir2, blockHex+".witness")
+	codeDir := filepath.Join(witnessDir, "codes")
+	diskdb := newCodeCachingDB(codeDir)
+	diskdb.loadCodesFromDisk()
+	config := params.BorMainnetChainConfig
+	engine := &benchConsensus{}
+	witness, err := loadWitnessFromJSON(witnessPath)
+	if err != nil { t.Fatalf("loading witness: %v", err) }
+	blockData, err := fetchAndCacheBlock(blockHex, alchemyURL)
+	if err != nil { t.Fatalf("fetching block: %v", err) }
+	block, _, _, err := parseBlockFromJSON(blockData)
+	if err != nil { t.Fatalf("parsing block: %v", err) }
+	if err := prewarmCodes(diskdb, witness, block, blockHex, config, alchemyURL); err != nil {
+		t.Logf("prewarm: %v", err)
+	}
+	author := getAuthor(config, witness.Header())
+	serialState, _, err := executeStatelessSerial(config, block, witness, &author, engine, diskdb)
+	if err != nil { t.Fatalf("serial: %v", err) }
+	numProcs := runtime.NumCPU()
+	for run := 0; run < 20; run++ {
+		baselineState, _, _, err := executeStatelessParallel(config, block, witness, &author, engine, diskdb, numProcs, false)
+		if err != nil { t.Fatalf("baseline run %d: %v", run, err) }
+		if serialState != baselineState {
+			t.Errorf("run=%d BASELINE stateRoot mismatch", run)
+		} else {
+			t.Logf("run=%d BASELINE OK", run)
 		}
 	}
 }

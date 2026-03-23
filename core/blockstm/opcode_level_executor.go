@@ -471,7 +471,7 @@ func (pe *OpcodeLevelExecutor) Step(res *ExecResult) (result ParallelExecutionRe
 
 		tx := toValidate[i]
 
-		if pe.skipCheck[tx] || ValidateVersion(tx, pe.lastTxIO, pe.mvh) {
+		if ValidateVersion(tx, pe.lastTxIO, pe.mvh) {
 			pe.validateTasks.markComplete(tx)
 		} else {
 			pe.cntValidationFail++

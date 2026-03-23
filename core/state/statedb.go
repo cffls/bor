@@ -876,15 +876,9 @@ func (s *StateDB) GetBalance(addr common.Address) *uint256.Int {
 		return uint256.NewInt(0)
 	}
 	balKey := blockstm.NewSubpathKey(addr, BalancePath)
-	if s.writeIndex != nil {
-		if _, addrWritten := s.writeAddrs[addr]; addrWritten {
-			if writeHasKey(s, balKey) {
-				if obj := s.stateObjects[addr]; obj != nil {
-					return obj.Balance()
-				}
-			}
-		}
-	}
+	// No self-write shortcut for balance. Always read from trie + ReadDelta
+	// (which covers prior txs) + this tx's own delta (from GetTxDelta).
+	// This ensures every GetBalance call records a validated delta read.
 	// Ensure stateObject is loaded into cache (needed by Finalise/IntermediateRoot).
 	// We don't use its balance (it may be stale from a prior tx), but the object
 	// must exist in s.stateObjects for trie updates.
@@ -901,6 +895,12 @@ func (s *StateDB) GetBalance(addr common.Address) *uint256.Int {
 	case blockstm.MVReadResultDelta:
 		baseBal.Add(baseBal, &deltaRes.Add)
 		baseBal.Sub(baseBal, &deltaRes.Sub)
+		// Also include this tx's own delta (WriteDelta entries at s.txIndex)
+		selfAdd, selfSub, hasSelf := s.mvHashmap.GetTxDelta(balKey, s.txIndex)
+		if hasSelf {
+			baseBal.Add(baseBal, &selfAdd)
+			baseBal.Sub(baseBal, &selfSub)
+		}
 		if s.cachedDeltaBal == nil {
 			s.cachedDeltaBal = make(map[common.Address]*uint256.Int)
 		}
@@ -923,11 +923,26 @@ func (s *StateDB) GetBalance(addr common.Address) *uint256.Int {
 			panic("Found dependency")
 		}
 	default:
+		// No prior deltas — but include this tx's own delta if any
+		selfAdd, selfSub, hasSelf := s.mvHashmap.GetTxDelta(balKey, s.txIndex)
+		if hasSelf {
+			baseBal.Add(baseBal, &selfAdd)
+			baseBal.Sub(baseBal, &selfSub)
+		}
+		if s.cachedDeltaBal == nil {
+			s.cachedDeltaBal = make(map[common.Address]*uint256.Int)
+		}
+		s.cachedDeltaBal[addr] = new(uint256.Int).Set(baseBal)
 		rd.Kind = blockstm.ReadKindStorage
 		rd.V = blockstm.Version{TxnIndex: -1, Incarnation: -1}
 	}
 	s.ensureReadList()
 	s.readList = append(s.readList, rd)
+	// Sync stateObject balance with GetBalance return value.
+	// This ensures SubBalance/AddBalance operate on the same value.
+	if obj := s.stateObjects[addr]; obj != nil {
+		obj.SetBalance(new(uint256.Int).Set(baseBal))
+	}
 	return baseBal
 }
 
@@ -1420,19 +1435,13 @@ func (s *StateDB) mvRecordWritten(object *stateObject) *stateObject {
 	}
 
 	copied := object.deepCopy(s)
-	// Apply cached delta balance if available (populated by a prior GetBalance).
-	// Do NOT call getBalanceForCache here — the ReadDelta races with concurrent
-	// WriteDelta and produces non-deterministic balances. If no cache exists,
-	// keep the stateObject's original balance. This is safe because
-	// mvRecordWrittenStorageOnly only handles storage-only writes — if a
-	// balance write follows, mvRecordWritten's Promote path applies the cache.
-	if s.cachedDeltaBal != nil {
-		if cachedBal, ok := s.cachedDeltaBal[object.Address()]; ok {
-			copied.SetBalance(new(uint256.Int).Set(cachedBal))
-		}
-	}
 	s.setStateObject(copied)
 	MVWrite(s, addrKey)
+	// Fix balance: call GetBalance which reads trie + accumulated deltas,
+	// records a read descriptor for validation, and syncs the stateObject.
+	if s.mvHashmap != nil {
+		s.GetBalance(object.Address())
+	}
 
 	return s.stateObjects[object.Address()]
 }
@@ -1458,15 +1467,6 @@ func (s *StateDB) mvRecordWrittenStorageOnly(object *stateObject) *stateObject {
 		}
 	}
 
-	// Populate the delta balance cache if needed (same logic as mvRecordWritten)
-	if s.mvHashmap != nil {
-		addr := object.Address()
-		hasCached := s.cachedDeltaBal != nil && s.cachedDeltaBal[addr] != nil
-		if !hasCached {
-			// GetBalance populates the cache and records a read descriptor
-			s.getBalanceForCache(addr)
-		}
-	}
 	copied := object.deepCopy(s)
 	if s.cachedDeltaBal != nil {
 		if cachedBal, ok := s.cachedDeltaBal[object.Address()]; ok {
