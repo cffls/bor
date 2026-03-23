@@ -922,6 +922,44 @@ func (s *StateDB) GetBalance(addr common.Address) *uint256.Int {
 	return baseBal
 }
 
+// getBalanceForCache computes the delta balance for addr and caches it.
+// Used by mvRecordWritten when GetBalance hasn't been called yet.
+// Reads trie_base + accumulated deltas and records a read descriptor.
+func (s *StateDB) getBalanceForCache(addr common.Address) {
+	if s.mvHashmap == nil {
+		return
+	}
+
+	balKey := blockstm.NewSubpathKey(addr, BalancePath)
+	baseBal := uint256.NewInt(0)
+	if acct, err := s.reader.Account(addr); err == nil && acct != nil {
+		baseBal = new(uint256.Int).Set(acct.Balance)
+	}
+
+	deltaRes := s.mvHashmap.ReadDelta(balKey, s.txIndex)
+	if deltaRes.Status == blockstm.MVReadResultDelta {
+		baseBal.Add(baseBal, &deltaRes.Add)
+		baseBal.Sub(baseBal, &deltaRes.Sub)
+	}
+
+	if s.cachedDeltaBal == nil {
+		s.cachedDeltaBal = make(map[common.Address]*uint256.Int)
+	}
+	s.cachedDeltaBal[addr] = baseBal
+
+	// Record read descriptor for validation
+	s.ensureReadList()
+	rd := blockstm.ReadDescriptor{Path: balKey}
+	if deltaRes.Status == blockstm.MVReadResultDelta {
+		rd.Kind = blockstm.ReadKindMap
+		rd.V = blockstm.Version{TxnIndex: -2, Incarnation: deltaRes.Version}
+	} else {
+		rd.Kind = blockstm.ReadKindStorage
+		rd.V = blockstm.Version{TxnIndex: -1, Incarnation: -1}
+	}
+	s.readList = append(s.readList, rd)
+}
+
 // GetNonce retrieves the nonce from the given address or 0 if object not found
 func (s *StateDB) GetNonce(addr common.Address) uint64 {
 	return MVRead(s, blockstm.NewSubpathKey(addr, NoncePath), 0, func(s *StateDB) uint64 {
@@ -1373,43 +1411,21 @@ func (s *StateDB) mvRecordWritten(object *stateObject) *stateObject {
 	}
 
 	copied := object.deepCopy(s)
-	// Fix stale balance using cached delta balance from GetBalance (preferred)
-	// or ReadDelta fallback for addresses not read via GetBalance.
+	// Populate the delta balance cache if needed. GetBalance records a read
+	// descriptor so validation catches stale deltas.
 	if s.mvHashmap != nil {
 		addr := object.Address()
-		if s.cachedDeltaBal != nil {
-			if cachedBal, ok := s.cachedDeltaBal[addr]; ok {
-				copied.SetBalance(new(uint256.Int).Set(cachedBal))
-				goto mvRecordWrittenDone
-			}
-		}
-		// Fallback: compute from ReadDelta and record as a balance read so
-		// validation catches stale deltas and forces re-execution.
-		balKey := blockstm.NewSubpathKey(addr, BalancePath)
-		deltaRes := s.mvHashmap.ReadDelta(balKey, s.txIndex)
-		if deltaRes.Status == blockstm.MVReadResultDelta {
-			baseBal := uint256.NewInt(0)
-			if acct, err := s.reader.Account(addr); err == nil && acct != nil {
-				baseBal = new(uint256.Int).Set(acct.Balance)
-			}
-			baseBal.Add(baseBal, &deltaRes.Add)
-			baseBal.Sub(baseBal, &deltaRes.Sub)
-			copied.SetBalance(baseBal)
-			// Record this read so validation catches delta changes
-			s.ensureReadList()
-			s.readList = append(s.readList, blockstm.ReadDescriptor{
-				Path: balKey,
-				Kind: blockstm.ReadKindMap,
-				V:    blockstm.Version{TxnIndex: -2, Incarnation: deltaRes.Version},
-			})
-			// Cache it too
-			if s.cachedDeltaBal == nil {
-				s.cachedDeltaBal = make(map[common.Address]*uint256.Int)
-			}
-			s.cachedDeltaBal[addr] = new(uint256.Int).Set(baseBal)
+		hasCached := s.cachedDeltaBal != nil && s.cachedDeltaBal[addr] != nil
+		if !hasCached {
+			s.getBalanceForCache(addr)
 		}
 	}
-mvRecordWrittenDone:
+	// Apply cached balance (always populated after the above)
+	if s.cachedDeltaBal != nil {
+		if cachedBal, ok := s.cachedDeltaBal[object.Address()]; ok {
+			copied.SetBalance(new(uint256.Int).Set(cachedBal))
+		}
+	}
 	s.setStateObject(copied)
 	MVWrite(s, addrKey)
 
@@ -1437,40 +1453,21 @@ func (s *StateDB) mvRecordWrittenStorageOnly(object *stateObject) *stateObject {
 		}
 	}
 
-	copied := object.deepCopy(s)
+	// Populate the delta balance cache if needed (same logic as mvRecordWritten)
 	if s.mvHashmap != nil {
 		addr := object.Address()
-		if s.cachedDeltaBal != nil {
-			if cachedBal, ok := s.cachedDeltaBal[addr]; ok {
-				copied.SetBalance(new(uint256.Int).Set(cachedBal))
-				goto storageOnlyDone
-			}
-		}
-		{
-			balKey := blockstm.NewSubpathKey(addr, BalancePath)
-			deltaRes := s.mvHashmap.ReadDelta(balKey, s.txIndex)
-			if deltaRes.Status == blockstm.MVReadResultDelta {
-				baseBal := uint256.NewInt(0)
-				if acct, err := s.reader.Account(addr); err == nil && acct != nil {
-					baseBal = new(uint256.Int).Set(acct.Balance)
-				}
-				baseBal.Add(baseBal, &deltaRes.Add)
-				baseBal.Sub(baseBal, &deltaRes.Sub)
-				copied.SetBalance(baseBal)
-				s.ensureReadList()
-				s.readList = append(s.readList, blockstm.ReadDescriptor{
-					Path: balKey,
-					Kind: blockstm.ReadKindMap,
-					V:    blockstm.Version{TxnIndex: -2, Incarnation: deltaRes.Version},
-				})
-				if s.cachedDeltaBal == nil {
-					s.cachedDeltaBal = make(map[common.Address]*uint256.Int)
-				}
-				s.cachedDeltaBal[addr] = new(uint256.Int).Set(baseBal)
-			}
+		hasCached := s.cachedDeltaBal != nil && s.cachedDeltaBal[addr] != nil
+		if !hasCached {
+			// GetBalance populates the cache and records a read descriptor
+			s.getBalanceForCache(addr)
 		}
 	}
-storageOnlyDone:
+	copied := object.deepCopy(s)
+	if s.cachedDeltaBal != nil {
+		if cachedBal, ok := s.cachedDeltaBal[object.Address()]; ok {
+			copied.SetBalance(new(uint256.Int).Set(cachedBal))
+		}
+	}
 	s.setStateObject(copied)
 
 	if s.mvStorageCopied == nil {

@@ -164,8 +164,11 @@ func CanTransfer(db vm.StateDB, addr common.Address, amount *uint256.Int) bool {
 // Transfer subtracts amount from sender and adds amount to recipient using the given Db
 func Transfer(db vm.StateDB, sender, recipient common.Address, amount *uint256.Int) {
 	if db.RecordTransfer(sender, recipient, amount) {
-		// Parallel mode: skip transfer log, just do the balance changes.
-		// The log will be reconstructed during settlement with finalized balances.
+		// Parallel mode: skip transfer log (reconstructed during settlement).
+		// Call GetBalance to record delta reads for validation — ensures
+		// the final incarnation sees the correct balance.
+		db.GetBalance(sender)
+		db.GetBalance(recipient)
 		db.SubBalance(sender, amount, tracing.BalanceChangeTransfer)
 		db.AddBalance(recipient, amount, tracing.BalanceChangeTransfer)
 		return
