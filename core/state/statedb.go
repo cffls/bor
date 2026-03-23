@@ -952,27 +952,38 @@ func (s *StateDB) getBalanceForCache(addr common.Address) {
 	}
 
 	deltaRes := s.mvHashmap.ReadDelta(balKey, s.txIndex)
-	if deltaRes.Status == blockstm.MVReadResultDelta {
+	switch deltaRes.Status {
+	case blockstm.MVReadResultDelta:
 		baseBal.Add(baseBal, &deltaRes.Add)
 		baseBal.Sub(baseBal, &deltaRes.Sub)
+		if s.cachedDeltaBal == nil {
+			s.cachedDeltaBal = make(map[common.Address]*uint256.Int)
+		}
+		s.cachedDeltaBal[addr] = baseBal
+		s.ensureReadList()
+		s.readList = append(s.readList, blockstm.ReadDescriptor{
+			Path: balKey,
+			Kind: blockstm.ReadKindMap,
+			V:    blockstm.Version{TxnIndex: -2, Incarnation: deltaRes.Version},
+		})
+	case blockstm.MVReadResultNone:
+		// No prior deltas — trie base is correct
+		if s.cachedDeltaBal == nil {
+			s.cachedDeltaBal = make(map[common.Address]*uint256.Int)
+		}
+		s.cachedDeltaBal[addr] = baseBal
+		s.ensureReadList()
+		s.readList = append(s.readList, blockstm.ReadDescriptor{
+			Path: balKey,
+			Kind: blockstm.ReadKindStorage,
+			V:    blockstm.Version{TxnIndex: -1, Incarnation: -1},
+		})
+	default:
+		// MVReadResultDependency or other — DON'T cache.
+		// Let the stateObject keep its ADDR key balance (deterministic per
+		// incarnation). GetBalance will be called later and handle the
+		// dependency properly (suspend or abort).
 	}
-
-	if s.cachedDeltaBal == nil {
-		s.cachedDeltaBal = make(map[common.Address]*uint256.Int)
-	}
-	s.cachedDeltaBal[addr] = baseBal
-
-	// Record read descriptor for validation
-	s.ensureReadList()
-	rd := blockstm.ReadDescriptor{Path: balKey}
-	if deltaRes.Status == blockstm.MVReadResultDelta {
-		rd.Kind = blockstm.ReadKindMap
-		rd.V = blockstm.Version{TxnIndex: -2, Incarnation: deltaRes.Version}
-	} else {
-		rd.Kind = blockstm.ReadKindStorage
-		rd.V = blockstm.Version{TxnIndex: -1, Incarnation: -1}
-	}
-	s.readList = append(s.readList, rd)
 }
 
 // GetNonce retrieves the nonce from the given address or 0 if object not found
