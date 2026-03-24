@@ -1826,6 +1826,38 @@ func TestWitnesses3Consistency(t *testing.T) {
 						t.Errorf("  tx=%d diff: GasUsed serial=%d parallel=%d Status serial=%d parallel=%d CumGas serial=%d parallel=%d Logs serial=%d parallel=%d rlpDiff=%v",
 							ti, sRcpt.GasUsed, pRcpt.GasUsed, sRcpt.Status, pRcpt.Status,
 							sRcpt.CumulativeGasUsed, pRcpt.CumulativeGasUsed, len(sRcpt.Logs), len(pRcpt.Logs), rlpDiff)
+						// When rlpDiff is true, dump the exact differing log params
+						if rlpDiff && len(sRcpt.Logs) == len(pRcpt.Logs) {
+							for li := 0; li < len(sRcpt.Logs); li++ {
+								sLog := sRcpt.Logs[li]
+								pLog := pRcpt.Logs[li]
+								// Print topic[0] (4 bytes) to identify log type
+								topicSig := "none"
+								if len(sLog.Topics) > 0 {
+									topicSig = fmt.Sprintf("%x", sLog.Topics[0][:4])
+								}
+								if !bytes.Equal(sLog.Data, pLog.Data) {
+									t.Errorf("  LOG_DIFF tx=%d log=%d topic0=%s dataLen serial=%d parallel=%d",
+										ti, li, topicSig, len(sLog.Data), len(pLog.Data))
+									// Data has 5 ABI-encoded uint256 params (each 32 bytes)
+									numParams := 5
+									for pi := 0; pi < numParams; pi++ {
+										start := pi * 32
+										end := start + 32
+										if end > len(sLog.Data) || end > len(pLog.Data) {
+											break
+										}
+										sParam := new(big.Int).SetBytes(sLog.Data[start:end])
+										pParam := new(big.Int).SetBytes(pLog.Data[start:end])
+										if sParam.Cmp(pParam) != 0 {
+											diff := new(big.Int).Sub(pParam, sParam)
+											t.Errorf("    param[%d] serial=%s parallel=%s diff=%s",
+												pi, sParam.String(), pParam.String(), diff.String())
+										}
+									}
+								}
+							}
+						}
 						diffs++
 						if diffs >= 3 {
 							break

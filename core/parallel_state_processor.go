@@ -269,11 +269,16 @@ func (task *ExecutionTask) Settle() {
 			amt := r.Amount.ToBig()
 			senderPre := new(big.Int).Set(getBal(r.Sender))
 			recipientPre := new(big.Int).Set(getBal(r.Recipient))
-			senderPost := new(big.Int).Sub(senderPre, amt)
-			recipientPost := new(big.Int).Add(recipientPre, amt)
-			snaps[i] = transferSnap{senderPre, recipientPre, senderPost, recipientPost}
-			balances[r.Sender] = senderPost
-			balances[r.Recipient] = recipientPost
+			if r.Sender == r.Recipient {
+				// Self-transfer: Sub+Add cancel out. Pre==Post for both.
+				snaps[i] = transferSnap{senderPre, recipientPre, senderPre, recipientPre}
+			} else {
+				senderPost := new(big.Int).Sub(senderPre, amt)
+				recipientPost := new(big.Int).Add(recipientPre, amt)
+				snaps[i] = transferSnap{senderPre, recipientPre, senderPost, recipientPost}
+				balances[r.Sender] = senderPost
+				balances[r.Recipient] = recipientPost
+			}
 		}
 
 		// Interleave speculative logs and transfer logs in the correct order.
