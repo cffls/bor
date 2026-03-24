@@ -195,10 +195,6 @@ func (task *ExecutionTask) Settle() {
 
 	task.finalStateDB.SetTxContext(task.tx.Hash(), task.index)
 
-	coinbaseBalance := task.finalStateDB.GetBalance(task.coinbase)
-	// Re-read sender balance from the settled state (not from speculative execution).
-	// The speculative SenderInitBalance may be stale if the opcode-level executor
-	// read it during a goroutine suspension with partially accumulated deltas.
 	senderInitBalance := task.finalStateDB.GetBalance(task.msg.From)
 
 	// Snapshot pre-tx balances for transfer log replay (before ApplyMVWriteSet).
@@ -218,6 +214,10 @@ func (task *ExecutionTask) Settle() {
 	}
 
 	task.finalStateDB.ApplyMVWriteSet(task.statedb.MVWriteList())
+
+	// Read coinbase balance AFTER applying write set (matches serial which
+	// reads after execution — includes any ETH transfers to coinbase).
+	coinbaseBalance := task.finalStateDB.GetBalance(task.coinbase)
 
 	// Merge speculative logs with deferred transfer logs in correct order.
 	specLogs := task.statedb.GetLogs(task.tx.Hash(), task.blockNumber.Uint64(), task.blockHash, task.blockTime)
