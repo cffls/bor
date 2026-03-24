@@ -1872,3 +1872,36 @@ func TestWitnesses3Consistency(t *testing.T) {
 	}
 	t.Logf("Total failures: %d", failures)
 }
+
+func TestWitnesses4Consistency(t *testing.T) {
+	alchemyURL := getAlchemyURL(t)
+	dir := "/tmp/witnesses_4"
+	if _, err := os.Stat(dir); os.IsNotExist(err) { t.Skipf("not found: %s", dir) }
+	entries, _ := os.ReadDir(dir)
+	config := params.BorMainnetChainConfig
+	engine := &benchConsensus{}
+	numProcs := runtime.NumCPU()
+	failures := 0
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".witness") { continue }
+		blockHex := strings.TrimSuffix(entry.Name(), ".witness")
+		codeDir := filepath.Join(witnessDir, "codes")
+		diskdb := newCodeCachingDB(codeDir)
+		diskdb.loadCodesFromDisk()
+		witness, err := loadWitnessFromJSON(filepath.Join(dir, entry.Name()))
+		if err != nil { t.Logf("%s: load err: %v", blockHex, err); continue }
+		blockData, err := fetchAndCacheBlock(blockHex, alchemyURL)
+		if err != nil { t.Logf("%s: fetch err: %v", blockHex, err); continue }
+		block, _, _, err := parseBlockFromJSON(blockData)
+		if err != nil { t.Logf("%s: parse err: %v", blockHex, err); continue }
+		prewarmCodes(diskdb, witness, block, blockHex, config, alchemyURL)
+		author := getAuthor(config, witness.Header())
+		ss, sr, _, err := executeStatelessSerial(config, block, witness, &author, engine, diskdb)
+		if err != nil { t.Logf("%s: serial err (skip): %v", blockHex, err); continue }
+		os, or, _, err := executeStatelessParallel(config, block, witness, &author, engine, diskdb, numProcs, true)
+		if err != nil { t.Logf("%s: opcode err (skip): %v", blockHex, err); continue }
+		if ss != os { t.Errorf("%s: stateRoot mismatch", blockHex); failures++ }
+		if sr != or { t.Errorf("%s: receiptRoot mismatch", blockHex); failures++ }
+	}
+	t.Logf("Total failures: %d", failures)
+}
