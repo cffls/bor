@@ -553,11 +553,11 @@ func loadTestBlocks(t testing.TB, alchemyURL string) ([]testBlockData, ethdb.Dat
 }
 
 // executeStatelessSerial runs serial stateless execution for one block.
-func executeStatelessSerial(config *params.ChainConfig, block *types.Block, witness *stateless.Witness, author *common.Address, engine consensus.Engine, diskdb ethdb.Database) (common.Hash, common.Hash, error) {
+func executeStatelessSerial(config *params.ChainConfig, block *types.Block, witness *stateless.Witness, author *common.Address, engine consensus.Engine, diskdb ethdb.Database) (common.Hash, common.Hash, *ProcessResult, error) {
 	memdb := witness.MakeHashDB(diskdb)
 	db, err := state.New(witness.Root(), state.NewDatabase(triedb.NewDatabase(memdb, triedb.HashDefaults), nil))
 	if err != nil {
-		return common.Hash{}, common.Hash{}, err
+		return common.Hash{}, common.Hash{}, nil, err
 	}
 
 	headerChain := &HeaderChain{
@@ -570,12 +570,12 @@ func executeStatelessSerial(config *params.ChainConfig, block *types.Block, witn
 
 	res, err := processor.Process(block, db, vm.Config{}, author, context.Background())
 	if err != nil {
-		return common.Hash{}, common.Hash{}, err
+		return common.Hash{}, common.Hash{}, nil, err
 	}
 
 	receiptRoot := types.DeriveSha(res.Receipts, trie.NewStackTrie(nil))
 	stateRoot := db.IntermediateRoot(config.IsEIP158(block.Number()))
-	return stateRoot, receiptRoot, nil
+	return stateRoot, receiptRoot, res, nil
 }
 
 // benchHeaderChain implements ChainContext for the parallel processor.
@@ -601,11 +601,11 @@ func (hc *benchHeaderChain) GetHeader(hash common.Hash, number uint64) *types.He
 }
 
 // executeStatelessParallel runs parallel BlockSTM execution for one block.
-func executeStatelessParallel(config *params.ChainConfig, block *types.Block, witness *stateless.Witness, author *common.Address, engine consensus.Engine, diskdb ethdb.Database, numProcs int, opcodeLevel bool) (common.Hash, common.Hash, blockstm.ParallelExecutionResult, error) {
+func executeStatelessParallel(config *params.ChainConfig, block *types.Block, witness *stateless.Witness, author *common.Address, engine consensus.Engine, diskdb ethdb.Database, numProcs int, opcodeLevel bool) (common.Hash, common.Hash, *ProcessResult, error) {
 	memdb := witness.MakeHashDB(diskdb)
 	db, err := state.New(witness.Root(), state.NewDatabase(triedb.NewDatabase(memdb, triedb.HashDefaults), nil))
 	if err != nil {
-		return common.Hash{}, common.Hash{}, blockstm.ParallelExecutionResult{}, err
+		return common.Hash{}, common.Hash{}, nil, err
 	}
 
 	hc := &benchHeaderChain{
@@ -631,12 +631,12 @@ func executeStatelessParallel(config *params.ChainConfig, block *types.Block, wi
 
 	res, err := processor.Process(block, db, vm.Config{}, author, context.Background())
 	if err != nil {
-		return common.Hash{}, common.Hash{}, blockstm.ParallelExecutionResult{}, err
+		return common.Hash{}, common.Hash{}, nil, err
 	}
 
 	receiptRoot := types.DeriveSha(res.Receipts, trie.NewStackTrie(nil))
 	stateRoot := db.IntermediateRoot(config.IsEIP158(block.Number()))
-	return stateRoot, receiptRoot, blockstm.ParallelExecutionResult{}, nil
+	return stateRoot, receiptRoot, res, nil
 }
 
 func getAlchemyURL(t testing.TB) string {
@@ -673,7 +673,7 @@ func TestMainnetWitnessSerial(t *testing.T) {
 
 	for i, bd := range blocks {
 		author := getAuthor(config, bd.witness.Header())
-		stateRoot, receiptRoot, err := executeStatelessSerial(config, bd.block, bd.witness, &author, engine, diskdb)
+		stateRoot, receiptRoot, _, err := executeStatelessSerial(config, bd.block, bd.witness, &author, engine, diskdb)
 		if err != nil {
 			t.Fatalf("block %d (%s): execution failed: %v", i, testBlockHexes[i], err)
 		}
@@ -696,7 +696,7 @@ func TestMainnetWitnessConsistency(t *testing.T) {
 	for i, bd := range blocks {
 		author := getAuthor(config, bd.witness.Header())
 
-		serialState, serialReceipt, err := executeStatelessSerial(config, bd.block, bd.witness, &author, engine, diskdb)
+		serialState, serialReceipt, _, err := executeStatelessSerial(config, bd.block, bd.witness, &author, engine, diskdb)
 		if err != nil {
 			t.Fatalf("block %s serial: %v", testBlockHexes[i], err)
 		}
@@ -1549,7 +1549,7 @@ func TestNewBlocksConsistency(t *testing.T) {
 			t.Logf("warning: prewarm codes for %s: %v", blockHex, err)
 		}
 		author := getAuthor(config, witness.Header())
-		serialState, serialReceipt, err := executeStatelessSerial(config, block, witness, &author, engine, diskdb)
+		serialState, serialReceipt, _, err := executeStatelessSerial(config, block, witness, &author, engine, diskdb)
 		if err != nil {
 			t.Logf("block %s: serial failed (skipping): %v", blockHex, err)
 			continue
@@ -1671,7 +1671,7 @@ func TestBlock0x4F2B1B6_Baseline(t *testing.T) {
 		t.Logf("prewarm: %v", err)
 	}
 	author := getAuthor(config, witness.Header())
-	serialState, _, err := executeStatelessSerial(config, block, witness, &author, engine, diskdb)
+	serialState, _, _, err := executeStatelessSerial(config, block, witness, &author, engine, diskdb)
 	if err != nil {
 		t.Fatalf("serial: %v", err)
 	}
@@ -1755,4 +1755,88 @@ func TestBlock0x4F2B1C4(t *testing.T) {
 	} else {
 		t.Logf("OK gas=%d", serialRes.GasUsed)
 	}
+}
+
+func TestWitnesses3Consistency(t *testing.T) {
+	alchemyURL := getAlchemyURL(t)
+	dir := "/tmp/witnesses_3"
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		t.Skipf("not found: %s", dir)
+	}
+	entries, _ := os.ReadDir(dir)
+	config := params.BorMainnetChainConfig
+	engine := &benchConsensus{}
+	numProcs := runtime.NumCPU()
+	failures := 0
+	for _, entry := range entries {
+		if !strings.HasSuffix(entry.Name(), ".witness") {
+			continue
+		}
+		blockHex := strings.TrimSuffix(entry.Name(), ".witness")
+		codeDir := filepath.Join(witnessDir, "codes")
+		diskdb := newCodeCachingDB(codeDir)
+		diskdb.loadCodesFromDisk()
+		witness, err := loadWitnessFromJSON(filepath.Join(dir, entry.Name()))
+		if err != nil {
+			t.Logf("%s: load err: %v", blockHex, err)
+			continue
+		}
+		blockData, err := fetchAndCacheBlock(blockHex, alchemyURL)
+		if err != nil {
+			t.Logf("%s: fetch err: %v", blockHex, err)
+			continue
+		}
+		block, _, _, err := parseBlockFromJSON(blockData)
+		if err != nil {
+			t.Logf("%s: parse err: %v", blockHex, err)
+			continue
+		}
+		prewarmCodes(diskdb, witness, block, blockHex, config, alchemyURL)
+		author := getAuthor(config, witness.Header())
+		ss, sr, serialRes, err := executeStatelessSerial(config, block, witness, &author, engine, diskdb)
+		if err != nil {
+			t.Logf("%s: serial err (skip): %v", blockHex, err)
+			continue
+		}
+		os, or, parallelRes, err := executeStatelessParallel(config, block, witness, &author, engine, diskdb, numProcs, true)
+		if err != nil {
+			t.Logf("%s: opcode err (skip): %v", blockHex, err)
+			continue
+		}
+		if ss != os {
+			t.Errorf("%s: stateRoot mismatch", blockHex)
+			failures++
+		}
+		if sr != or {
+			t.Errorf("%s: receiptRoot mismatch", blockHex)
+			failures++
+			// Per-receipt comparison for block 0x4F2C021
+			if strings.EqualFold(blockHex, "0x4F2C021") && serialRes != nil && parallelRes != nil {
+				diffs := 0
+				for ti := 0; ti < len(serialRes.Receipts) && ti < len(parallelRes.Receipts); ti++ {
+					sRcpt := serialRes.Receipts[ti]
+					pRcpt := parallelRes.Receipts[ti]
+					fieldDiff := sRcpt.GasUsed != pRcpt.GasUsed || sRcpt.Status != pRcpt.Status ||
+						sRcpt.CumulativeGasUsed != pRcpt.CumulativeGasUsed || len(sRcpt.Logs) != len(pRcpt.Logs)
+					// Also compare via RLP to catch log content / bloom differences
+					sRLP, _ := sRcpt.MarshalBinary()
+					pRLP, _ := pRcpt.MarshalBinary()
+					rlpDiff := !bytes.Equal(sRLP, pRLP)
+					if fieldDiff || rlpDiff {
+						t.Errorf("  tx=%d diff: GasUsed serial=%d parallel=%d Status serial=%d parallel=%d CumGas serial=%d parallel=%d Logs serial=%d parallel=%d rlpDiff=%v",
+							ti, sRcpt.GasUsed, pRcpt.GasUsed, sRcpt.Status, pRcpt.Status,
+							sRcpt.CumulativeGasUsed, pRcpt.CumulativeGasUsed, len(sRcpt.Logs), len(pRcpt.Logs), rlpDiff)
+						diffs++
+						if diffs >= 3 {
+							break
+						}
+					}
+				}
+				if diffs == 0 {
+					t.Errorf("  0x4F2C021: receipt root differs but all %d receipts match field-by-field and RLP", len(serialRes.Receipts))
+				}
+			}
+		}
+	}
+	t.Logf("Total failures: %d", failures)
 }
