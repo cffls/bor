@@ -657,6 +657,12 @@ var sharedFeeLogFn = state.TransferLogFn(func(db *state.StateDB, sender, recipie
 })
 
 func (e *v2Env) Recycle(st blockstm.V2TxState) {
+	// Bad-block diagnostics need the final per-tx PDBs (gas + recorded read
+	// set) intact after execution. Recycling reuses/resets them, so skip it
+	// when the diagnostic is on — results are identical, only more allocs.
+	if v2DiagEnabled() {
+		return
+	}
 	if pdb, ok := st.(*state.ParallelStateDB); ok {
 		select {
 		case e.recycleCh <- pdb:
@@ -1138,6 +1144,13 @@ func (p *V2StateProcessor) Process(block *types.Block, statedb *state.StateDB, c
 	// Copy() deep-copies the witness; re-share so BLOCKHASH writes reach finalDB.
 	readBase := statedb.Copy()
 	readBase.SetWitness(prevWitness)
+	// Clean post-system-call parent snapshot for bad-block diagnostics
+	// (BOR_V2_DIAG). Captured pre-settlement so a divergence can be re-run
+	// serially. Only allocated when the diagnostic is enabled.
+	var diagBase *state.StateDB
+	if v2DiagEnabled() {
+		diagBase = statedb.Copy()
+	}
 	store := blockstm.NewMVStore()
 	bals := blockstm.NewMVBalanceStore()
 
@@ -1166,6 +1179,13 @@ func (p *V2StateProcessor) Process(block *types.Block, statedb *state.StateDB, c
 	// no-op success.
 	if result.ExecErrIdx >= 0 {
 		return nil, fmt.Errorf("v2: tx %d apply message: %w", result.ExecErrIdx, result.ExecErr)
+	}
+
+	// Bad-block diagnostics: V2's gas diverged from the canonical (header) gas.
+	// Freeze the failure to disk (divergent tx + recorded read-set vs the
+	// serial-correct values) before the result is discarded.
+	if diagBase != nil && result.GasUsed != block.GasUsed() {
+		dumpV2BadBlock(block, common.Hash{}, blockCtx, config, result, diagBase, header.BaseFee)
 	}
 
 	// V2 worker reads went through pool copies that share `statedb`'s reader
