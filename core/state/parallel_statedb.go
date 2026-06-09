@@ -610,20 +610,35 @@ func (s *ParallelStateDB) Exist(addr common.Address) bool {
 	if suicideIdx >= 0 {
 		// Most recent action was destruction. The account is gone unless
 		// a later tx implicitly recreated it via AddBalance (value
-		// transfer doesn't touch CreatePath, only MVBalanceStore).
-		// GetBalance records its own read so validation catches drift.
+		// transfer doesn't touch CreatePath, only MVBalanceStore) or by
+		// bumping its nonce (e.g. a 7702 delegation clear). GetBalance /
+		// GetNonce record their own reads so validation catches drift.
 		if !s.GetBalance(addr).IsZero() {
+			return true
+		}
+		if s.GetNonce(addr) > 0 {
 			return true
 		}
 		return false
 	}
-	// No prior creation or destruction. Fall through to base + balance
-	// check (handles base-state accounts and addresses created implicitly
-	// by a prior tx's value transfer).
+	// No prior creation or destruction. Fall through to base + balance +
+	// nonce check (handles base-state accounts and addresses made to exist
+	// by a prior tx's value transfer or nonce bump).
 	if s.base.Exist(addr) {
 		return true
 	}
 	if !s.GetBalance(addr).IsZero() {
+		return true
+	}
+	// Serial StateDB.Exist is getStateObject()!=nil, and an account with
+	// nonce>0 is not empty — so it exists. ParallelStateDB historically
+	// omitted this nonce check: an account made to exist purely by a prior
+	// in-block nonce bump (a sender increment, or a 7702 delegation clear —
+	// SetNonce writes NoncePath but NOT CreatePath) was reported absent.
+	// That flipped EIP-7702 applyAuthorization's Exist-gated 12500 refund and
+	// the new-account CALL surcharge, over-charging gas and splitting from
+	// serial. GetNonce records the read so validation now catches drift.
+	if s.GetNonce(addr) > 0 {
 		return true
 	}
 	return false
