@@ -146,6 +146,15 @@ type ParallelStateDB struct {
 	// Per-tx cache for GetCommittedState — ensures SSTORE original is stable
 	committedCache map[stateKey]common.Hash
 
+	// Per-tx cache for CodePath reads — ensures repeated GetCode/GetCodeHash of
+	// the same address within one tx observe ONE consistent value. The EVM
+	// resolves a 7702-delegated account via two separate GetCode(addr) reads
+	// (resolveCode + resolveCodeHash); without snapshot isolation a concurrent
+	// writer between them can make them follow different delegation targets,
+	// building a Contract whose Code and CodeHash disagree (poisoning the shared
+	// jumpdest cache). Mirrors balCache/committedCache/destructedCache.
+	codeReadCache map[common.Address]codeKeyRead
+
 	// Recorded transfers for log generation during settlement
 	Transfers []TransferRecord
 
@@ -248,6 +257,7 @@ func (s *ParallelStateDB) Reset(txIndex int, base *SafeBase, store *blockstm.MVS
 	s.destructedCache = nil
 	s.destructedSeen = nil
 	s.committedCache = nil
+	s.codeReadCache = nil
 	s.Transfers = s.Transfers[:0]
 	s.FeeData = nil
 	s.Coinbase = common.Address{}
@@ -292,6 +302,33 @@ func (s *ParallelStateDB) readStoreWait(key blockstm.Key) (interface{}, int, int
 		}
 		return nil, -1, 0, false
 	}
+}
+
+// codeKeyRead is a cached CodePath readStoreWait result (see codeReadCache).
+type codeKeyRead struct {
+	val       interface{}
+	writerIdx int
+	writerInc int
+	found     bool
+}
+
+// readCodeKey reads addr's CodePath via readStoreWait, cached per-tx so that the
+// EVM's two 7702-resolution reads (resolveCode + resolveCodeHash, each a
+// GetCode(addr)) observe ONE consistent value. Without this, a concurrent writer
+// landing between the two reads can redirect them to different delegation
+// targets, yielding a Contract whose Code and CodeHash disagree.
+func (s *ParallelStateDB) readCodeKey(addr common.Address, codeKey blockstm.Key) (interface{}, int, int, bool) {
+	if s.codeReadCache != nil {
+		if c, ok := s.codeReadCache[addr]; ok {
+			return c.val, c.writerIdx, c.writerInc, c.found
+		}
+	}
+	val, writerIdx, writerInc, found := s.readStoreWait(codeKey)
+	if s.codeReadCache == nil {
+		s.codeReadCache = make(map[common.Address]codeKeyRead, 2)
+	}
+	s.codeReadCache[addr] = codeKeyRead{val: val, writerIdx: writerIdx, writerInc: writerInc, found: found}
+	return val, writerIdx, writerInc, found
 }
 
 // handleEstimate decides what readStoreWait should do when it observes
@@ -721,7 +758,7 @@ func (s *ParallelStateDB) GetCode(addr common.Address) []byte {
 	}
 	suicideIdx := s.priorDestructedAt(addr)
 	codeKey := blockstm.NewSubpathKey(addr, CodePath)
-	if val, writerIdx, writerInc, found := s.readStoreWait(codeKey); found {
+	if val, writerIdx, writerInc, found := s.readCodeKey(addr, codeKey); found {
 		s.recordStoreRead(codeKey, writerIdx, writerInc, val)
 		if writerIdx > suicideIdx {
 			return val.([]byte)
@@ -757,7 +794,7 @@ func (s *ParallelStateDB) GetCodeHash(addr common.Address) common.Hash {
 	// path as GetCode and record the read so validation can catch a stale
 	// value when the writer is later invalidated.
 	codeKey := blockstm.NewSubpathKey(addr, CodePath)
-	if val, writerIdx, writerInc, found := s.readStoreWait(codeKey); found {
+	if val, writerIdx, writerInc, found := s.readCodeKey(addr, codeKey); found {
 		s.recordStoreRead(codeKey, writerIdx, writerInc, val)
 		// Honor the code write only if it happened after the destruction
 		// (otherwise the destruction wiped it).
